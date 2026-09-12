@@ -1,6 +1,9 @@
 name: Windows CI
 
 on:
+  # 手动触发（本分支新增）：新建仓库的首次 push 不会触发 Actions，
+  # 且需要在不改动代码的情况下重跑构建时也用它。
+  workflow_dispatch:
   push:
     branches: [main]
     paths-ignore:
