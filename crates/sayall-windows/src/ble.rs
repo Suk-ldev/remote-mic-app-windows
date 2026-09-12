@@ -1,10 +1,12 @@
 use crate::wetype_revive::{response_since, wetype_mic_observation, MicObservation, MicResponse};
 use crate::{
-    audio::AudioRuntime, power::PowerNotifications, reconnect::ReconnectBackoff,
+    audio::AudioRuntime,
+    power::PowerNotifications,
+    reconnect::ReconnectBackoff,
     remote_model_from_model_number, remote_model_from_name,
     send_input::{KeyChord, VoiceHotkeyMode, VoiceHotkeySettings},
-    send_input_windows::SendInputRuntime, ConnectionPhase, ConnectionSnapshot, PlatformError,
-    RemoteModel, UsageCounters,
+    send_input_windows::SendInputRuntime,
+    ConnectionPhase, ConnectionSnapshot, PlatformError, RemoteModel, UsageCounters,
 };
 use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
 use std::future::IntoFuture;
