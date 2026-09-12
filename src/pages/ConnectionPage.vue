@@ -650,7 +650,7 @@ onUnmounted(() => {
         </div>
         <div class="voice-hotkey-modes" role="group" aria-label="触发方式">
           <button
-            :class="voiceHotkey.mode === 'hold' ? 'primary-button' : 'secondary-button'"
+            :class="voiceHotkeyEnabled && voiceHotkey.mode === 'hold' ? 'primary-button' : 'secondary-button'"
             type="button"
             title="语音开始按下快捷键、结束松开：微信输入法、Win+H 等按住即录音的工具"
             :disabled="savingVoiceHotkey || capturingHotkey || !voiceHotkeyEnabled || voiceHotkey.mode === 'hold'"
@@ -659,7 +659,7 @@ onUnmounted(() => {
             按住说话
           </button>
           <button
-            :class="voiceHotkey.mode === 'toggle' ? 'primary-button' : 'secondary-button'"
+            :class="voiceHotkeyEnabled && voiceHotkey.mode === 'toggle' ? 'primary-button' : 'secondary-button'"
             type="button"
             title="语音开始点按一次、结束再点按一次：Typeless 等按一次开始、再按一次结束的工具"
             :disabled="savingVoiceHotkey || capturingHotkey || !voiceHotkeyEnabled || voiceHotkey.mode === 'toggle'"
