@@ -15,6 +15,8 @@ credentials.json
 *.cer
 *.key
 *.pem
+# 更新签名密钥（本机保存，绝不进仓库——私钥一旦公开即作废）
+updater-keys/
 *.exe
 *.msi
 *.zip
