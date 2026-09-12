@@ -1,5 +1,5 @@
 use sayall_windows::raw_input::RawInputSnapshot;
-use sayall_windows::send_input::{KeyChord, SendInputSnapshot};
+use sayall_windows::send_input::{KeyChord, SendInputSnapshot, VoiceHotkeySettings};
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
     PlatformSnapshot, UsageCounters, WindowsPlatform,
@@ -34,8 +34,8 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
     /// 打开/激活预设应用（测试按钮与引擎共用路径）。
     fn launch_app(&self, target: &str) -> Result<(), PlatformError>;
-    fn voice_hold_hotkey(&self) -> Option<KeyChord>;
-    fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>);
+    fn voice_hold_hotkey(&self) -> VoiceHotkeySettings;
+    fn set_voice_hold_hotkey(&self, hotkey: VoiceHotkeySettings);
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings;
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings);
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
@@ -131,11 +131,11 @@ impl PlatformRuntime for WindowsPlatform {
             .map_err(|error| PlatformError::SendInput(error.to_string()))
     }
 
-    fn voice_hold_hotkey(&self) -> Option<KeyChord> {
+    fn voice_hold_hotkey(&self) -> VoiceHotkeySettings {
         WindowsPlatform::voice_hold_hotkey(self)
     }
 
-    fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>) {
+    fn set_voice_hold_hotkey(&self, hotkey: VoiceHotkeySettings) {
         WindowsPlatform::set_voice_hold_hotkey(self, hotkey)
     }
 
@@ -168,7 +168,7 @@ mod simulation {
     use super::*;
     use sayall_core::{AtvvCapabilities, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
     use sayall_windows::raw_input::{RawInputPhase, RemoteButton};
-    use sayall_windows::send_input::{plan_key_tap, KeyChord};
+    use sayall_windows::send_input::{plan_key_tap, KeyChord, VoiceHotkeySettings};
     use sayall_windows::{AudioPhase, ConnectionPhase, RemoteModel};
     use std::sync::{Mutex, MutexGuard};
 
@@ -203,7 +203,7 @@ mod simulation {
     pub struct SimulatedPlatform {
         usage: Arc<UsageCounters>,
         state: Mutex<SimulationState>,
-        voice_hold_hotkey: Mutex<Option<KeyChord>>,
+        voice_hold_hotkey: Mutex<VoiceHotkeySettings>,
         button_mappings: Mutex<sayall_windows::send_input::ButtonMappings>,
     }
 
@@ -420,11 +420,11 @@ mod simulation {
             Ok(())
         }
 
-        fn voice_hold_hotkey(&self) -> Option<KeyChord> {
+        fn voice_hold_hotkey(&self) -> VoiceHotkeySettings {
             lock(&self.voice_hold_hotkey).clone()
         }
 
-        fn set_voice_hold_hotkey(&self, hotkey: Option<KeyChord>) {
+        fn set_voice_hold_hotkey(&self, hotkey: VoiceHotkeySettings) {
             *lock(&self.voice_hold_hotkey) = hotkey;
         }
 

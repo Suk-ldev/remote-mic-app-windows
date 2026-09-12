@@ -452,7 +452,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .usage-hint-details ol { margin: 8px 0 0; padding-left: 18px; line-height: 1.6; font-size: 13px; color: var(--text-subtle-strong); }
 .voice-hotkey-row { margin-top: 10px; }
 .voice-hotkey-row p { margin: 0; font-size: 13px; }
-.voice-hotkey-presets { justify-content: flex-start; margin-top: 8px; }
+.voice-hotkey-presets { justify-content: flex-start; margin-top: 8px; flex-wrap: wrap; }
+/* 触发方式分段控件：与预设行同宽同间距，视觉上属于同一组设置。 */
+.voice-hotkey-modes { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.voice-hotkey-ime { margin-top: 10px; white-space: normal; align-items: flex-start; }
+.voice-hotkey-ime span { line-height: 1.5; }
 .endpoint-list li small { font-size: 12.5px; }
 .endpoint-select-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .endpoint-count { font-size: 12.5px; }

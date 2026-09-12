@@ -487,6 +487,127 @@ impl KeyChord {
     }
 }
 
+/// 语音输入快捷键的注入形态（第三方语音工具的触发方式，不是遥控器语音键
+/// 自身的生命周期——语音键始终是"按下开始、释放结束"，见 AGENTS.md）。
+///
+/// - [`VoiceHotkeyMode::Hold`]：按住说话。语音会话开始注入 DOWN 边沿、
+///   结束注入 UP 边沿，快捷键在整段语音期间保持按下（微信输入法、
+///   Win+H 等"按住即录音"的工具）。
+/// - [`VoiceHotkeyMode::Toggle`]：单次触发。语音会话开始点按一次、结束
+///   再点按一次（Typeless 等"按一次开始、再按一次结束"的工具；macOS 版
+///   的"语音键模拟 Fn 点按"是同一产品行为，见 ATTRIBUTION.md）。
+///
+/// 两种形态都必须严格成对：正常松手、断连、睡眠、中止和退出路径上，
+/// 结束边沿必发一次且只发一次（ble.rs `finish_voice_hotkey` 单点负责）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceHotkeyMode {
+    #[default]
+    Hold,
+    Toggle,
+}
+
+impl VoiceHotkeyMode {
+    /// 诊断日志用的稳定标识（不随 UI 文案变化）。
+    pub fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Toggle => "toggle",
+        }
+    }
+}
+
+/// 语音输入快捷键设置：快捷键本身 + 注入形态 + 是否在注入前把当前会话
+/// 切到微信输入法。
+///
+/// `activate_wetype` 只对微信输入法有意义（其语音热键仅在 WeType 为当前
+/// 会话活动输入法时生效，见 ime.rs）。对 Typeless 这类独立应用必须关闭：
+/// 强行切换输入法会改变用户正在使用的输入法，属于"比现状更差"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceHotkeySettings {
+    /// None = 关闭快捷键注入（语音键仅输出音频）。
+    pub chord: Option<KeyChord>,
+    pub mode: VoiceHotkeyMode,
+    pub activate_wetype: bool,
+}
+
+impl Default for VoiceHotkeySettings {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl VoiceHotkeySettings {
+    pub fn disabled() -> Self {
+        Self {
+            chord: None,
+            mode: VoiceHotkeyMode::Hold,
+            activate_wetype: false,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.chord.is_some()
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.chord.as_ref().map_or(0, |chord| chord.keys.len())
+    }
+
+    pub fn validated(mut self) -> Result<Self, SendInputError> {
+        match self.chord.take() {
+            Some(chord) => self.chord = Some(chord.validated()?),
+            None => {
+                // 关闭时形态与输入法激活无意义，归一化避免残留值误导日志。
+                self.mode = VoiceHotkeyMode::Hold;
+                self.activate_wetype = false;
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// 磁盘/IPC 兼容层：`voice-hold-hotkey.json` 的 v1 形状是裸 `Option<KeyChord>`
+/// （`null` 或 `{"keys":[...]}`）。v2 起是对象 `{chord, mode, activateWetype}`。
+/// 两种形状都要能读出来，且 v1 文件必须保持原行为（Hold + 微信输入法激活）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceHotkeySettingsWire {
+    chord: Option<KeyChord>,
+    mode: Option<VoiceHotkeyMode>,
+    activate_wetype: Option<bool>,
+    /// v1 裸 KeyChord 的字段；仅在没有 `chord` 时作为快捷键来源。
+    keys: Option<Vec<KeyCode>>,
+}
+
+impl<'de> Deserialize<'de> for VoiceHotkeySettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // v1 的 `null` = 关闭；对象形状再按字段区分 v1/v2。
+        let Some(wire) = Option::<VoiceHotkeySettingsWire>::deserialize(deserializer)? else {
+            return Ok(Self::disabled());
+        };
+        let VoiceHotkeySettingsWire {
+            chord,
+            mode,
+            activate_wetype,
+            keys,
+        } = wire;
+        let legacy = chord.is_none() && keys.is_some();
+        let chord = chord.or_else(|| keys.map(|keys| KeyChord { keys }));
+        Ok(Self {
+            chord,
+            mode: mode.unwrap_or_default(),
+            // v1 文件只可能是微信输入法配方（当时是唯一支持的目标），
+            // 保持其原有的会话级激活行为；v2 未写该字段时按关闭处理。
+            activate_wetype: activate_wetype.unwrap_or(legacy),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlannedKeyEvent {
     pub key: KeyCode,
@@ -696,6 +817,85 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn voice_hotkey_settings_round_trip_through_json() {
+        let settings = VoiceHotkeySettings {
+            chord: Some(chord(&[KeyCode::RightAlt])),
+            mode: VoiceHotkeyMode::Toggle,
+            activate_wetype: false,
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(encoded.contains("\"activateWetype\""));
+        assert!(encoded.contains("\"toggle\""));
+        assert_eq!(
+            serde_json::from_str::<VoiceHotkeySettings>(&encoded).unwrap(),
+            settings
+        );
+    }
+
+    /// v1 的 `voice-hold-hotkey.json` 是裸 Option<KeyChord>：必须按原行为
+    /// 读出（按住说话 + 微信输入法会话级激活），否则升级后老用户的微信
+    /// 输入法会停止响应。
+    #[test]
+    fn voice_hotkey_settings_read_legacy_bare_chord_files() {
+        let legacy: VoiceHotkeySettings =
+            serde_json::from_str(r#"{"keys":["left_control","left_windows"]}"#).unwrap();
+        assert_eq!(
+            legacy.chord,
+            Some(chord(&[KeyCode::LeftControl, KeyCode::LeftWindows]))
+        );
+        assert_eq!(legacy.mode, VoiceHotkeyMode::Hold);
+        assert!(legacy.activate_wetype);
+
+        let legacy_disabled: VoiceHotkeySettings = serde_json::from_str("null").unwrap();
+        assert_eq!(legacy_disabled, VoiceHotkeySettings::disabled());
+
+        // v2 文件未写 activateWetype 时按关闭处理（只有 v1 形状继承激活）。
+        let modern: VoiceHotkeySettings =
+            serde_json::from_str(r#"{"chord":{"keys":["f5"]},"mode":"toggle"}"#).unwrap();
+        assert_eq!(modern.mode, VoiceHotkeyMode::Toggle);
+        assert!(!modern.activate_wetype);
+    }
+
+    #[test]
+    fn voice_hotkey_validation_rejects_bad_chords_and_normalizes_disabled() {
+        let invalid = VoiceHotkeySettings {
+            chord: Some(chord(&[])),
+            mode: VoiceHotkeyMode::Toggle,
+            activate_wetype: true,
+        };
+        assert_eq!(invalid.validated(), Err(SendInputError::EmptyChord));
+
+        let disabled = VoiceHotkeySettings {
+            chord: None,
+            mode: VoiceHotkeyMode::Toggle,
+            activate_wetype: true,
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(disabled, VoiceHotkeySettings::disabled());
+        assert!(!disabled.is_enabled());
+        assert_eq!(disabled.key_count(), 0);
+    }
+
+    /// 单次触发形态的开始/结束边沿都是完整点按：结束边沿必须能让目标
+    /// 工具停止录音，因此与开始边沿同形（DOWN 全部 → 反序 UP 全部）。
+    #[test]
+    fn toggle_edges_are_a_full_tap_submitted_one_event_at_a_time() {
+        let events = plan_key_tap(&chord(&[KeyCode::LeftControl, KeyCode::LeftWindows])).unwrap();
+        let mut submitted = Vec::new();
+        let sent = send_key_edges_spaced_with(&events, Duration::ZERO, |batch| {
+            assert_eq!(batch.len(), 1, "和弦必须逐事件提交（零间隔单批被实证拒绝）");
+            submitted.push(batch[0]);
+            Ok(batch.len())
+        })
+        .unwrap();
+        assert_eq!(sent, 4);
+        assert_eq!(submitted, events);
+        assert!(submitted[..2].iter().all(|event| !event.is_key_up));
+        assert!(submitted[2..].iter().all(|event| event.is_key_up));
     }
 
     #[test]

@@ -209,7 +209,7 @@ impl Default for ConnectionSnapshot {
 #[derive(Clone)]
 pub struct WindowsPlatform {
     usage: Arc<UsageCounters>,
-    voice_hold_hotkey: Arc<Mutex<Option<send_input::KeyChord>>>,
+    voice_hold_hotkey: Arc<Mutex<send_input::VoiceHotkeySettings>>,
     button_mapping: Arc<ButtonMappingRuntime>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
     // 抑制器与门控句柄"持有即运行"：字段本身不被读取，随平台生命周期保活
@@ -255,7 +255,7 @@ impl MappingInjector for UnsupportedInjector {
 impl Default for WindowsPlatform {
     fn default() -> Self {
         let usage = Arc::new(UsageCounters::default());
-        let voice_hold_hotkey = Arc::new(Mutex::new(None));
+        let voice_hold_hotkey = Arc::new(Mutex::new(send_input::VoiceHotkeySettings::disabled()));
         let raw_input_snapshot = Arc::new(Mutex::new(RawInputSnapshot::default()));
         #[cfg(windows)]
         {
@@ -332,11 +332,11 @@ impl WindowsPlatform {
         Arc::clone(&self.usage)
     }
 
-    pub fn voice_hold_hotkey(&self) -> Option<send_input::KeyChord> {
+    pub fn voice_hold_hotkey(&self) -> send_input::VoiceHotkeySettings {
         lock(&self.voice_hold_hotkey).clone()
     }
 
-    pub fn set_voice_hold_hotkey(&self, hotkey: Option<send_input::KeyChord>) {
+    pub fn set_voice_hold_hotkey(&self, hotkey: send_input::VoiceHotkeySettings) {
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
 

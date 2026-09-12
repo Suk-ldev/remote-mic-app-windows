@@ -1,7 +1,7 @@
 use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::send_input::{
-    ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot,
+    ButtonAction, ButtonMappings, ButtonTrigger, SendInputSnapshot, VoiceHotkeySettings,
 };
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformSnapshot,
@@ -475,26 +475,30 @@ fn get_send_input_snapshot(state: tauri::State<'_, AppState>) -> SendInputSnapsh
 }
 
 #[tauri::command]
-fn get_voice_hold_hotkey(state: tauri::State<'_, AppState>) -> Option<KeyChord> {
+fn get_voice_hold_hotkey(state: tauri::State<'_, AppState>) -> VoiceHotkeySettings {
     let hotkey = state.platform.voice_hold_hotkey();
     sayall_windows::gatt_note(format!(
-        "shortcut_settings feature=voice_hold action=load phase=completed terminal_result=passed enabled={} key_count={}",
-        hotkey.is_some(),
-        hotkey.as_ref().map(|chord| chord.keys.len()).unwrap_or(0)
+        "shortcut_settings feature=voice_hold action=load phase=completed terminal_result=passed enabled={} key_count={} mode={} activate_wetype={}",
+        hotkey.is_enabled(),
+        hotkey.key_count(),
+        hotkey.mode.as_log_str(),
+        hotkey.activate_wetype
     ));
     hotkey
 }
 
 #[tauri::command]
 async fn set_voice_hold_hotkey(
-    hotkey: Option<KeyChord>,
+    hotkey: VoiceHotkeySettings,
     state: tauri::State<'_, AppState>,
-) -> Result<Option<KeyChord>, String> {
+) -> Result<VoiceHotkeySettings, String> {
     let started = std::time::Instant::now();
-    let enabled = hotkey.is_some();
-    let key_count = hotkey.as_ref().map(|chord| chord.keys.len()).unwrap_or(0);
+    let enabled = hotkey.is_enabled();
+    let key_count = hotkey.key_count();
+    let mode = hotkey.mode.as_log_str();
+    let activate_wetype = hotkey.activate_wetype;
     sayall_windows::gatt_note(format!(
-        "shortcut_settings feature=voice_hold action=save phase=requested enabled={enabled} key_count={key_count}"
+        "shortcut_settings feature=voice_hold action=save phase=requested enabled={enabled} key_count={key_count} mode={mode} activate_wetype={activate_wetype}"
     ));
     let platform = Arc::clone(&state.platform);
     let settings = state.settings.clone();
@@ -506,15 +510,15 @@ async fn set_voice_hold_hotkey(
     .await
     {
         Ok(result) => result,
-        Err(error) => Err(format!("保存按住说话快捷键任务失败：{error}")),
+        Err(error) => Err(format!("保存语音输入快捷键任务失败：{error}")),
     };
     sayall_windows::gatt_note(match &result {
         Ok(_) => format!(
-            "shortcut_settings feature=voice_hold action=save phase=completed terminal_result=passed enabled={enabled} key_count={key_count} elapsed_ms={}",
+            "shortcut_settings feature=voice_hold action=save phase=completed terminal_result=passed enabled={enabled} key_count={key_count} mode={mode} activate_wetype={activate_wetype} elapsed_ms={}",
             started.elapsed().as_millis()
         ),
         Err(_) => format!(
-            "shortcut_settings feature=voice_hold action=save phase=completed terminal_result=failed enabled={enabled} key_count={key_count} error_domain=settings error_code=save_failed reason=validation_or_persistence_failed retryable=true elapsed_ms={}",
+            "shortcut_settings feature=voice_hold action=save phase=completed terminal_result=failed enabled={enabled} key_count={key_count} mode={mode} activate_wetype={activate_wetype} error_domain=settings error_code=save_failed reason=validation_or_persistence_failed retryable=true elapsed_ms={}",
             started.elapsed().as_millis()
         ),
     });
@@ -1058,9 +1062,11 @@ pub fn run() {
             match settings.load_voice_hold_hotkey() {
                 Ok(hotkey) => {
                     sayall_windows::gatt_note(format!(
-                        "shortcut_settings feature=voice_hold action=load phase=completed terminal_result=passed enabled={} key_count={}",
-                        hotkey.is_some(),
-                        hotkey.as_ref().map(|chord| chord.keys.len()).unwrap_or(0)
+                        "shortcut_settings feature=voice_hold action=load phase=completed terminal_result=passed enabled={} key_count={} mode={} activate_wetype={}",
+                        hotkey.is_enabled(),
+                        hotkey.key_count(),
+                        hotkey.mode.as_log_str(),
+                        hotkey.activate_wetype
                     ));
                     platform.set_voice_hold_hotkey(hotkey)
                 }
@@ -1069,7 +1075,7 @@ pub fn run() {
                         "shortcut_settings feature=voice_hold action=load phase=completed terminal_result=failed error_domain=settings error_code=parse_or_read_failed reason=disabled_fallback retryable=true".to_owned(),
                     );
                     eprintln!("{error}");
-                    platform.set_voice_hold_hotkey(None);
+                    platform.set_voice_hold_hotkey(VoiceHotkeySettings::disabled());
                 }
             }
 

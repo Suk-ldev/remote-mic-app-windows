@@ -1,5 +1,5 @@
 use sayall_core::{AppSettings, ThemePreference, UsageStatistics};
-use sayall_windows::send_input::{ButtonMappings, KeyChord};
+use sayall_windows::send_input::{ButtonMappings, KeyChord, VoiceHotkeySettings};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -168,52 +168,56 @@ impl SettingsStore {
         self.save_button_mappings(configuration.button_mappings)
     }
 
-    pub fn load_voice_hold_hotkey(&self) -> Result<Option<KeyChord>, String> {
+    pub fn load_voice_hold_hotkey(&self) -> Result<VoiceHotkeySettings, String> {
         let _guard = lock(&self.access);
         self.load_voice_hold_hotkey_unlocked()
     }
 
-    /// v1 默认按住说话快捷键：左 Ctrl + 左 Win（适配微信输入法的默认语音热键）。
-    pub fn default_voice_hold_hotkey() -> Option<KeyChord> {
-        Some(KeyChord {
-            keys: vec![
-                sayall_windows::send_input::KeyCode::LeftControl,
-                sayall_windows::send_input::KeyCode::LeftWindows,
-            ],
-        })
+    /// 首次启动的默认语音输入快捷键：左 Ctrl + 左 Win 的按住说话形态
+    /// （适配微信输入法的默认语音热键，并为其做会话级输入法激活）。
+    pub fn default_voice_hold_hotkey() -> VoiceHotkeySettings {
+        VoiceHotkeySettings {
+            chord: Some(KeyChord {
+                keys: vec![
+                    sayall_windows::send_input::KeyCode::LeftControl,
+                    sayall_windows::send_input::KeyCode::LeftWindows,
+                ],
+            }),
+            mode: sayall_windows::send_input::VoiceHotkeyMode::Hold,
+            activate_wetype: true,
+        }
     }
 
-    fn load_voice_hold_hotkey_unlocked(&self) -> Result<Option<KeyChord>, String> {
+    fn load_voice_hold_hotkey_unlocked(&self) -> Result<VoiceHotkeySettings, String> {
         let path = self.voice_hold_hotkey_path();
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Ok(Self::default_voice_hold_hotkey())
             }
-            Err(error) => return Err(format!("读取按住说话快捷键失败：{error}")),
+            Err(error) => return Err(format!("读取语音输入快捷键失败：{error}")),
         };
-        serde_json::from_str::<Option<KeyChord>>(&contents)
-            .map_err(|error| format!("解析按住说话快捷键失败：{error}"))
+        // v1 的裸 Option<KeyChord> 文件由 VoiceHotkeySettings 的反序列化
+        // 兼容层直接读出（按住说话 + 微信输入法激活），无需迁移写回。
+        serde_json::from_str::<VoiceHotkeySettings>(&contents)
+            .map_err(|error| format!("解析语音输入快捷键失败：{error}"))
     }
 
     pub fn save_voice_hold_hotkey(
         &self,
-        hotkey: Option<KeyChord>,
-    ) -> Result<Option<KeyChord>, String> {
+        hotkey: VoiceHotkeySettings,
+    ) -> Result<VoiceHotkeySettings, String> {
         let _guard = lock(&self.access);
-        if let Some(chord) = &hotkey {
-            chord
-                .clone()
-                .validated()
-                .map_err(|error| format!("按住说话快捷键无效：{error}"))?;
-        }
+        let hotkey = hotkey
+            .validated()
+            .map_err(|error| format!("语音输入快捷键无效：{error}"))?;
         let path = self.voice_hold_hotkey_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
         }
         let contents = serde_json::to_vec_pretty(&hotkey)
-            .map_err(|error| format!("序列化按住说话快捷键失败：{error}"))?;
-        fs::write(path, contents).map_err(|error| format!("保存按住说话快捷键失败：{error}"))?;
+            .map_err(|error| format!("序列化语音输入快捷键失败：{error}"))?;
+        fs::write(path, contents).map_err(|error| format!("保存语音输入快捷键失败：{error}"))?;
         Ok(hotkey)
     }
 
@@ -429,39 +433,85 @@ mod tests {
 
     #[test]
     fn voice_hold_hotkey_round_trips_and_validates_chord() {
+        use sayall_windows::send_input::VoiceHotkeyMode;
+
         let store = SettingsStore::new(std::env::temp_dir().join(format!(
             "sayall-test-voice-hold-{}.json",
             std::process::id()
         )));
         let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
 
-        // 缺省文件 = v1 默认（左 Ctrl + 左 Win）
+        // 缺省文件 = 出厂默认（左 Ctrl + 左 Win 按住说话，微信输入法激活）
         let default = store.load_voice_hold_hotkey().unwrap();
         assert_eq!(default, SettingsStore::default_voice_hold_hotkey());
         assert_eq!(
-            default.unwrap().keys,
+            default.chord.unwrap().keys,
             vec![
                 sayall_windows::send_input::KeyCode::LeftControl,
                 sayall_windows::send_input::KeyCode::LeftWindows,
             ]
         );
+        assert_eq!(default.mode, VoiceHotkeyMode::Hold);
+        assert!(default.activate_wetype);
 
-        let right_alt = KeyChord {
-            keys: vec![sayall_windows::send_input::KeyCode::RightAlt],
+        // 单次触发（Typeless 等）：形态与"不切换输入法"一并往返。
+        let toggle = VoiceHotkeySettings {
+            chord: Some(KeyChord {
+                keys: vec![sayall_windows::send_input::KeyCode::RightAlt],
+            }),
+            mode: VoiceHotkeyMode::Toggle,
+            activate_wetype: false,
         };
-        let saved = store
-            .save_voice_hold_hotkey(Some(right_alt.clone()))
+        let saved = store.save_voice_hold_hotkey(toggle.clone()).unwrap();
+        assert_eq!(saved, toggle);
+        assert_eq!(store.load_voice_hold_hotkey().unwrap(), toggle);
+
+        let disabled = store
+            .save_voice_hold_hotkey(VoiceHotkeySettings::disabled())
             .unwrap();
-        assert_eq!(saved, Some(right_alt.clone()));
-        assert_eq!(store.load_voice_hold_hotkey().unwrap(), Some(right_alt));
+        assert_eq!(disabled, VoiceHotkeySettings::disabled());
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            VoiceHotkeySettings::disabled()
+        );
 
-        let disabled = store.save_voice_hold_hotkey(None).unwrap();
-        assert_eq!(disabled, None);
-        assert_eq!(store.load_voice_hold_hotkey().unwrap(), None);
-
-        let invalid = KeyChord { keys: vec![] };
-        assert!(store.save_voice_hold_hotkey(Some(invalid)).is_err());
+        let invalid = VoiceHotkeySettings {
+            chord: Some(KeyChord { keys: vec![] }),
+            ..VoiceHotkeySettings::disabled()
+        };
+        assert!(store.save_voice_hold_hotkey(invalid).is_err());
 
         let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+    }
+
+    /// v1 文件（裸 Option<KeyChord>）必须保持原行为：按住说话 + 微信输入法
+    /// 会话级激活，不因新增形态字段而变成"不切换输入法"。
+    #[test]
+    fn legacy_voice_hold_hotkey_file_keeps_hold_and_wetype_activation() {
+        use sayall_windows::send_input::VoiceHotkeyMode;
+
+        let store = SettingsStore::new(std::env::temp_dir().join(format!(
+            "sayall-test-voice-hold-legacy-{}.json",
+            std::process::id()
+        )));
+        let path = store.voice_hold_hotkey_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, br#"{"keys":["left_control","left_windows"]}"#).unwrap();
+
+        let loaded = store.load_voice_hold_hotkey().unwrap();
+        assert_eq!(loaded, SettingsStore::default_voice_hold_hotkey());
+        assert_eq!(loaded.mode, VoiceHotkeyMode::Hold);
+        assert!(loaded.activate_wetype);
+
+        // v1 的"关闭" = 文件内容 null。
+        std::fs::write(&path, b"null").unwrap();
+        assert_eq!(
+            store.load_voice_hold_hotkey().unwrap(),
+            VoiceHotkeySettings::disabled()
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

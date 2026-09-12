@@ -1,7 +1,8 @@
 use crate::wetype_revive::{response_since, wetype_mic_observation, MicObservation, MicResponse};
 use crate::{
     audio::AudioRuntime, power::PowerNotifications, reconnect::ReconnectBackoff,
-    remote_model_from_model_number, remote_model_from_name, send_input::KeyChord,
+    remote_model_from_model_number, remote_model_from_name,
+    send_input::{KeyChord, VoiceHotkeyMode, VoiceHotkeySettings},
     send_input_windows::SendInputRuntime, ConnectionPhase, ConnectionSnapshot, PlatformError,
     RemoteModel, UsageCounters,
 };
@@ -56,7 +57,7 @@ impl BleRuntime {
         audio: Arc<AudioRuntime>,
         usage: Arc<UsageCounters>,
         send_input: Arc<SendInputRuntime>,
-        voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
+        voice_hold_hotkey: Arc<Mutex<VoiceHotkeySettings>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
@@ -209,7 +210,7 @@ fn worker_loop(
     audio: Arc<AudioRuntime>,
     usage: Arc<UsageCounters>,
     send_input: Arc<SendInputRuntime>,
-    voice_hold_hotkey: Arc<Mutex<Option<KeyChord>>>,
+    voice_hold_hotkey: Arc<Mutex<VoiceHotkeySettings>>,
 ) {
     if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
         *lock(&state) = failed_snapshot(format!("WinRT 初始化失败：{error}"));
@@ -225,7 +226,7 @@ fn worker_loop(
     let mut preferred_device_id: Option<String> = None;
     let mut system_suspended = false;
     let mut backoff = ReconnectBackoff::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
-    let mut held_hotkey: Option<KeyChord> = None;
+    let mut active_hotkey: Option<ActiveVoiceHotkey> = None;
     let mut extend_deadline: Option<Instant> = None;
     // 语音会话纪元：每次会话开始（StreamStarted）+1。wetype_check 重试
     // 阶梯（最长 ~7.4s）用它区分"本会话仍在流式"与"旧会话已结束、
@@ -256,7 +257,7 @@ fn worker_loop(
                                 &mut pipeline,
                                 &audio,
                                 &send_input,
-                                &mut held_hotkey,
+                                &mut active_hotkey,
                                 &mut connection_generation,
                             ) {
                                 keep_reconnecting_after_cleanup_failure(
@@ -292,7 +293,7 @@ fn worker_loop(
                                     &state,
                                     &audio,
                                     &send_input,
-                                    &mut held_hotkey,
+                                    &mut active_hotkey,
                                     &mut session,
                                     &mut pipeline,
                                     &mut connection_generation,
@@ -419,7 +420,7 @@ fn worker_loop(
                     &state,
                     &audio,
                     &send_input,
-                    &mut held_hotkey,
+                    &mut active_hotkey,
                     &mut session,
                     &mut pipeline,
                     &mut connection_generation,
@@ -458,7 +459,7 @@ fn worker_loop(
                     &mut pipeline,
                     &audio,
                     &send_input,
-                    &mut held_hotkey,
+                    &mut active_hotkey,
                     &mut connection_generation,
                 );
                 match result {
@@ -552,21 +553,30 @@ fn worker_loop(
                     ));
                     continue;
                 }
-                let chord_configured = lock(&voice_hold_hotkey).clone();
-                if let (Some(chord), Some(old)) = (chord_configured, held_hotkey.as_ref()) {
-                    if send_input.release(old).is_err() {
+                let chord_configured = lock(&voice_hold_hotkey).chord.clone();
+                // 该阶梯只修复 Hold 形态（释放并重按按住中的和弦）；单次
+                // 触发形态重放点按会关掉刚开始的录音，武装时已跳过，这里
+                // 再做一次守卫，防配置在会话中途改动。
+                let holding = active_hotkey
+                    .as_ref()
+                    .filter(|active| active.mode == VoiceHotkeyMode::Hold);
+                if let (Some(chord), Some(old)) = (chord_configured, holding) {
+                    if send_input.release(&old.chord).is_err() {
                         gatt_note(format!(
                             "chord_retry result=err reason=release_failed epoch={epoch}"
                         ));
                         continue;
                     }
-                    held_hotkey = None;
+                    active_hotkey = None;
                     match send_input.press(&chord) {
                         Ok(_) => {
                             gatt_note(format!(
                                 "chord_retry result=ok attempt={attempt} epoch={epoch}"
                             ));
-                            held_hotkey = Some(chord);
+                            active_hotkey = Some(ActiveVoiceHotkey {
+                                chord,
+                                mode: VoiceHotkeyMode::Hold,
+                            });
                             spawn_wetype_check(
                                 &state,
                                 sender.clone(),
@@ -598,7 +608,7 @@ fn worker_loop(
                         &audio,
                         &send_input,
                         &voice_hold_hotkey,
-                        &mut held_hotkey,
+                        &mut active_hotkey,
                         &usage,
                         &mut active_voice_samples,
                         &mut extend_deadline,
@@ -625,7 +635,7 @@ fn worker_loop(
                             &mut pipeline,
                             &audio,
                             &send_input,
-                            &mut held_hotkey,
+                            &mut active_hotkey,
                             &mut connection_generation,
                         ) {
                             keep_reconnecting_after_cleanup_failure(
@@ -659,7 +669,7 @@ fn worker_loop(
                         &state,
                         &audio,
                         &send_input,
-                        &mut held_hotkey,
+                        &mut active_hotkey,
                         &mut active_voice_samples,
                         &bytes,
                     );
@@ -678,7 +688,7 @@ fn worker_loop(
                         &mut pipeline,
                         &audio,
                         &send_input,
-                        &mut held_hotkey,
+                        &mut active_hotkey,
                         &mut connection_generation,
                     ) {
                         keep_reconnecting_after_cleanup_failure(
@@ -719,7 +729,7 @@ fn worker_loop(
                         &mut pipeline,
                         &audio,
                         &send_input,
-                        &mut held_hotkey,
+                        &mut active_hotkey,
                         &mut connection_generation,
                     ) {
                         keep_reconnecting_after_cleanup_failure(
@@ -748,7 +758,7 @@ fn worker_loop(
                     &mut pipeline,
                     &audio,
                     &send_input,
-                    &mut held_hotkey,
+                    &mut active_hotkey,
                     &mut connection_generation,
                 ) {
                     keep_reconnecting_after_cleanup_failure(
@@ -794,7 +804,7 @@ fn worker_loop(
                 }
             }
             WorkerMessage::Shutdown => {
-                release_voice_hold_hotkey(&send_input, &mut held_hotkey);
+                release_voice_hold_hotkey(&send_input, &mut active_hotkey);
                 let _ = audio.interrupt_session();
                 let _ = close_session(&mut session);
                 pipeline.interrupt();
@@ -837,7 +847,7 @@ fn attempt_connection(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
     session: &mut Option<BleSession>,
     pipeline: &mut AtvvVoicePipeline,
     connection_generation: &mut u64,
@@ -848,7 +858,7 @@ fn attempt_connection(
         pipeline,
         audio,
         send_input,
-        held_hotkey,
+        active_hotkey,
         connection_generation,
     )?;
     let previous = reconnecting.then(|| lock(state).clone());
@@ -889,11 +899,11 @@ fn invalidate_connection(
     pipeline: &mut AtvvVoicePipeline,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
     connection_generation: &mut u64,
 ) -> Result<(), PlatformError> {
     *connection_generation = connection_generation.wrapping_add(1);
-    release_voice_hold_hotkey(send_input, held_hotkey);
+    release_voice_hold_hotkey(send_input, active_hotkey);
     let mut cleanup_errors = Vec::new();
     if let Err(error) = audio.interrupt_session() {
         cleanup_errors.push(format!("音频中断：{error}"));
@@ -965,8 +975,8 @@ fn handle_control(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    voice_hold_hotkey: &Mutex<Option<KeyChord>>,
-    held_hotkey: &mut Option<KeyChord>,
+    voice_hold_hotkey: &Mutex<VoiceHotkeySettings>,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
     usage: &UsageCounters,
     active_voice_samples: &mut u64,
     extend_deadline: &mut Option<Instant>,
@@ -1043,20 +1053,39 @@ fn handle_control(
             // 仅在确有泄漏时放行到 OS——恰好只在需要时生效。
             send_input.release_stuck_f5();
             std::thread::sleep(Duration::from_millis(20));
-            // 按住说话快捷键（参考 ZSTDJan/Voice_VibeCoding）：先注入快捷键
-            // DOWN，再开始音频会话；注入失败直接中止本次会话并统一释放。
-            if let Some(chord) = lock(voice_hold_hotkey).clone() {
-                let mic_baseline = wetype_mic_observation();
+            // 语音输入快捷键（参考 ZSTDJan/Voice_VibeCoding 的 Hold 时序、
+            // macOS 版"语音键模拟 Fn 点按"的单次触发形态）：先注入开始边沿，
+            // 再开始音频会话；注入失败直接中止本次会话并统一释放。
+            let hotkey = lock(voice_hold_hotkey).clone();
+            if let Some(chord) = hotkey.chord.clone() {
+                let mode = hotkey.mode;
+                // 开麦基线只服务于 Hold 形态的微信输入法休眠重试阶梯
+                // （见下）；单次触发形态不做该阶梯，因此也不读基线，
+                // 语音开始的关键路径上不多花一次 ConsentStore 查询。
+                let mic_baseline = if mode == VoiceHotkeyMode::Hold {
+                    wetype_mic_observation()
+                } else {
+                    None
+                };
                 // 会话级激活微信输入法：其语音热键只在自身为当前会话活动
                 // 输入法时生效（2026-09-05 持锁实验，evidence/p）；激活后零
                 // 延迟注入 3/3 触发，不增加按键延迟。失败仅记录提示，按原
-                // 行为注入（不比现状更差）。
-                if let Err(error) = crate::ime::activate_wetype_session() {
-                    lock(state).last_error = Some(error);
+                // 行为注入（不比现状更差）。仅在用户把目标配置为微信输入法
+                // 时执行——对 Typeless 等独立应用强切输入法会改变用户正在
+                // 使用的输入法，属于"比现状更差"。
+                if hotkey.activate_wetype {
+                    if let Err(error) = crate::ime::activate_wetype_session() {
+                        lock(state).last_error = Some(error);
+                    }
                 }
-                if let Err(error) = send_input.press(&chord) {
+                let injected = match mode {
+                    VoiceHotkeyMode::Hold => send_input.press(&chord),
+                    VoiceHotkeyMode::Toggle => send_input.tap_spaced(&chord),
+                };
+                if let Err(error) = injected {
                     gatt_note(format!(
-                        "chord_press result=err session={session_id} error_domain=send_input error_code=press_failed reason=injection_failed retryable=true"
+                        "chord_press result=err session={session_id} mode={} error_domain=send_input error_code=press_failed reason=injection_failed retryable=true",
+                        mode.as_log_str()
                     ));
                     abort_voice_session(
                         session,
@@ -1064,32 +1093,42 @@ fn handle_control(
                         state,
                         audio,
                         send_input,
-                        held_hotkey,
+                        active_hotkey,
                         active_voice_samples,
                         Some(session_id),
-                        format!("按住说话快捷键注入失败：{error}"),
+                        format!("语音输入快捷键注入失败：{error}"),
                     );
                     return;
                 }
-                // 功能点日志：成功按下（含会话号，与 C 04 行对齐即可归因）。
+                // 功能点日志：成功注入开始边沿（含会话号与形态，与 C 04 行
+                // 对齐即可归因）。
                 gatt_note(format!(
-                    "chord_press result=ok session={session_id} gap_ms={}",
+                    "chord_press result=ok session={session_id} mode={} gap_ms={}",
+                    mode.as_log_str(),
                     crate::send_input::HOLD_CHORD_EVENT_GAP.as_millis(),
                 ));
-                *held_hotkey = Some(chord);
+                *active_hotkey = Some(ActiveVoiceHotkey { chord, mode });
                 // WeType 热键休眠检测与自动恢复（见 spawn_wetype_check）。
                 // 纪元在 StreamStarted 顶部已递增并捕获（见上），连同引用
                 // 传入，防旧阶梯跨会话误伤新会话的和弦。
-                spawn_wetype_check(
-                    state,
-                    sender.clone(),
-                    0,
-                    epoch,
-                    voice_session_epoch,
-                    mic_baseline,
-                );
+                // 仅 Hold 模式：该阶梯是"释放并重按按住中的和弦"的微信输入法
+                // 专项修复，对单次触发形态重放点按会直接关掉刚开始的录音。
+                if mode == VoiceHotkeyMode::Hold {
+                    spawn_wetype_check(
+                        state,
+                        sender.clone(),
+                        0,
+                        epoch,
+                        voice_session_epoch,
+                        mic_baseline,
+                    );
+                } else {
+                    gatt_note(format!(
+                        "chord_check skipped session={session_id} reason=toggle_mode"
+                    ));
+                }
             } else {
-                // 功能点日志：会话开始但未配置按住说话快捷键（无注入环节）。
+                // 功能点日志：会话开始但未配置语音输入快捷键（无注入环节）。
                 gatt_note(format!(
                     "chord_press result=skipped session={session_id} reason=no_hotkey"
                 ));
@@ -1104,7 +1143,7 @@ fn handle_control(
                     state,
                     audio,
                     send_input,
-                    held_hotkey,
+                    active_hotkey,
                     active_voice_samples,
                     Some(session_id),
                     error.to_string(),
@@ -1126,7 +1165,10 @@ fn handle_control(
             // 自行检查会话状态并清除，无需逐处清理）。
             *extend_deadline = None;
             // 松手统一释放：无论音频排空是否成功，先释放按住的快捷键。
-            release_voice_hold_hotkey(send_input, held_hotkey);
+            // 单次触发形态的结束点按推迟到排空结束（见下），此处只解除
+            // F5 抑制器武装并结束 Hold 形态，保持既有按住说话行为不变。
+            crate::key_suppressor::set_session_active(false);
+            finish_voice_hotkey_for_mode(send_input, active_hotkey, VoiceHotkeyMode::Hold);
             {
                 let mut snapshot = lock(state);
                 snapshot.phase = ConnectionPhase::Draining;
@@ -1140,13 +1182,18 @@ fn handle_control(
                     state,
                     audio,
                     send_input,
-                    held_hotkey,
+                    active_hotkey,
                     active_voice_samples,
                     None,
                     error.to_string(),
                 );
                 return;
             }
+            // 排空结束：单次触发形态在此点按第二次结束录音（与 macOS 版
+            // "在语音流开始和排空结束时各发送一次点按"一致）。放在排空之后
+            // 是为了不截断尾音——虚拟声卡里还没播完的音频，目标语音工具
+            // 仍在录。已经结束过的会话在此是空操作（结束边沿只发一次）。
+            finish_voice_hotkey(send_input, active_hotkey);
             if let Err(error) = pipeline.complete_drain(generation) {
                 lock(state).last_error = Some(error.to_string());
                 return;
@@ -1170,7 +1217,7 @@ fn handle_audio(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
     active_voice_samples: &mut u64,
     bytes: &[u8],
 ) {
@@ -1184,7 +1231,7 @@ fn handle_audio(
             state,
             audio,
             send_input,
-            held_hotkey,
+            active_hotkey,
             active_voice_samples,
             pipeline.session_id(),
             error,
@@ -1204,7 +1251,7 @@ fn handle_audio(
                     state,
                     audio,
                     send_input,
-                    held_hotkey,
+                    active_hotkey,
                     active_voice_samples,
                     pipeline.session_id(),
                     error.to_string(),
@@ -1229,12 +1276,12 @@ fn abort_voice_session(
     state: &Arc<Mutex<ConnectionSnapshot>>,
     audio: &AudioRuntime,
     send_input: &SendInputRuntime,
-    held_hotkey: &mut Option<KeyChord>,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
     active_voice_samples: &mut u64,
     session_id: Option<u8>,
     error: String,
 ) {
-    release_voice_hold_hotkey(send_input, held_hotkey);
+    release_voice_hold_hotkey(send_input, active_hotkey);
     if let (Some(connected), Some(capabilities), Some(session_id)) =
         (session.as_mut(), pipeline.capabilities(), session_id)
     {
@@ -1254,31 +1301,72 @@ fn abort_voice_session(
     snapshot.last_error = Some(error);
 }
 
-/// 统一释放按住说话快捷键：只在当前持有和弦时发送一次反向 UP 边沿，
-/// 并立即清除持有状态，保证断连、睡眠、中止和退出路径不会留下粘住的按键。
-/// 释放失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
+/// 本次语音会话实际注入的快捷键：和弦 + 注入形态。形态随会话开始时的
+/// 配置定格，用户中途改配置不会让结束边沿与开始边沿不成对。
+#[derive(Debug, Clone)]
+struct ActiveVoiceHotkey {
+    chord: KeyChord,
+    mode: VoiceHotkeyMode,
+}
+
+/// 统一结束语音输入快捷键：只在本次会话确有注入时发送一次结束边沿
+/// （Hold = 反向 UP 边沿；Toggle = 再点按一次），并立即清除持有状态，
+/// 保证断连、睡眠、中止和退出路径既不留粘住的按键，也不留一直在录的
+/// 语音工具。失败会记录在 SendInput 快照的 last_error 中，由诊断摘要呈现。
 /// 同时解除语音键 F5 抑制器的会话武装（覆盖停止/中止/断连/退出全部路径）。
-fn release_voice_hold_hotkey(send_input: &SendInputRuntime, held_hotkey: &mut Option<KeyChord>) {
+fn release_voice_hold_hotkey(
+    send_input: &SendInputRuntime,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
+) {
     crate::key_suppressor::set_session_active(false);
-    if let Some(chord) = held_hotkey.take() {
-        // 功能点日志：释放结果（与 chord_press 成对，粘键排查的另一半）。
-        let result = send_input.release(&chord);
-        gatt_note(format!(
-            "chord_release result={} error_domain={} error_code={} reason={} retryable={}",
-            if result.is_ok() { "ok" } else { "err" },
-            if result.is_ok() { "none" } else { "send_input" },
-            if result.is_ok() {
-                "none"
-            } else {
-                "release_failed"
-            },
-            if result.is_ok() {
-                "released"
-            } else {
-                "backend_rejected"
-            },
-            result.is_err(),
-        ));
+    finish_voice_hotkey(send_input, active_hotkey);
+}
+
+/// 结束边沿单点：任何路径最终都经由这里发出，因此"只发一次且必发一次"
+/// 只需在这一处保证（`take()` 即消费）。
+fn finish_voice_hotkey(
+    send_input: &SendInputRuntime,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
+) {
+    let Some(active) = active_hotkey.take() else {
+        return;
+    };
+    let result = match active.mode {
+        VoiceHotkeyMode::Hold => send_input.release(&active.chord),
+        VoiceHotkeyMode::Toggle => send_input.tap_spaced(&active.chord),
+    };
+    // 功能点日志：结束结果（与 chord_press 成对，粘键/粘麦排查的另一半）。
+    gatt_note(format!(
+        "chord_release result={} mode={} error_domain={} error_code={} reason={} retryable={}",
+        if result.is_ok() { "ok" } else { "err" },
+        active.mode.as_log_str(),
+        if result.is_ok() { "none" } else { "send_input" },
+        if result.is_ok() {
+            "none"
+        } else {
+            "release_failed"
+        },
+        if result.is_ok() {
+            "released"
+        } else {
+            "backend_rejected"
+        },
+        result.is_err(),
+    ));
+}
+
+/// 只结束指定形态的会话快捷键（其余形态原样留给后续路径）：正常松手
+/// 路径用它让 Hold 保持"松手即释放"，把 Toggle 的结束点按留到排空之后。
+fn finish_voice_hotkey_for_mode(
+    send_input: &SendInputRuntime,
+    active_hotkey: &mut Option<ActiveVoiceHotkey>,
+    mode: VoiceHotkeyMode,
+) {
+    if active_hotkey
+        .as_ref()
+        .is_some_and(|active| active.mode == mode)
+    {
+        finish_voice_hotkey(send_input, active_hotkey);
     }
 }
 

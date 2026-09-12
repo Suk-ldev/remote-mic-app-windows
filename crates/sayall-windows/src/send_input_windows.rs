@@ -1,6 +1,6 @@
 use crate::send_input::{
-    plan_key_down, plan_key_up, send_key_edges_spaced_with, send_key_tap_with, KeyChord,
-    PlannedKeyEvent, SendInputError, SendInputSnapshot, HOLD_CHORD_EVENT_GAP,
+    plan_key_down, plan_key_tap, plan_key_up, send_key_edges_spaced_with, send_key_tap_with,
+    KeyChord, PlannedKeyEvent, SendInputError, SendInputSnapshot, HOLD_CHORD_EVENT_GAP,
 };
 use crate::PlatformError;
 use std::mem::size_of;
@@ -76,6 +76,22 @@ impl SendInputRuntime {
         let result =
             send_key_edges_spaced_with(&events, HOLD_CHORD_EVENT_GAP, real_send_input_batch);
         self.record(result, "SendInput key-up")
+    }
+
+    /// 点按整个和弦（DOWN 全部 → 反序 UP 全部），逐事件提交、事件间
+    /// HOLD_CHORD_EVENT_GAP 间隔——单次触发型语音工具（Typeless 等）的
+    /// 开始/结束点按。
+    ///
+    /// 与按键映射的 [`Self::tap`]（单批零间隔）刻意不同：语音工具的热键
+    /// 与微信输入法同属"注入和弦"路径，单批零间隔被实证拒绝（evidence/p，
+    /// 2026-09-04），且间隔同时给出了非零的按下时长——瞬时 DOWN+UP 可能
+    /// 被目标应用当作抖动丢弃。
+    pub fn tap_spaced(&self, chord: &KeyChord) -> Result<SendInputSnapshot, PlatformError> {
+        let events =
+            plan_key_tap(chord).map_err(|error| PlatformError::SendInput(error.to_string()))?;
+        let result =
+            send_key_edges_spaced_with(&events, HOLD_CHORD_EVENT_GAP, real_send_input_batch);
+        self.record(result, "SendInput key-tap")
     }
 
     /// 注入单个 F5 释放沿，清理可能粘在 OS 键态的 F5（2026-09-05 21:08

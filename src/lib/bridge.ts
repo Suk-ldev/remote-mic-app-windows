@@ -90,6 +90,28 @@ export interface KeyChord {
   keys: KeyCode[];
 }
 
+/**
+ * 语音输入快捷键的注入形态（第三方语音工具的触发方式；遥控器语音键本身
+ * 始终是"按住说话"）。
+ * - hold：语音开始按下、结束松开（微信输入法、Win+H 等按住即录音的工具）。
+ * - toggle：语音开始点按一次、结束再点按一次（Typeless 等单次触发的工具）。
+ */
+export type VoiceHotkeyMode = "hold" | "toggle";
+
+export interface VoiceHotkeySettings {
+  /** null = 关闭快捷键注入（语音键仅输出音频）。 */
+  chord: KeyChord | null;
+  mode: VoiceHotkeyMode;
+  /** 注入前把当前会话切到微信输入法；仅微信输入法需要，其他工具必须关闭。 */
+  activateWetype: boolean;
+}
+
+export const disabledVoiceHotkey = (): VoiceHotkeySettings => ({
+  chord: null,
+  mode: "hold",
+  activateWetype: false,
+});
+
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
@@ -618,18 +640,20 @@ export async function getSendInputSnapshot(): Promise<SendInputSnapshot> {
   return invoke<SendInputSnapshot>("get_send_input_snapshot");
 }
 
-export async function getVoiceHoldHotkey(): Promise<KeyChord | null> {
+export async function getVoiceHoldHotkey(): Promise<VoiceHotkeySettings> {
   if (!isTauriRuntime()) {
-    return null;
+    return disabledVoiceHotkey();
   }
-  return invoke<KeyChord | null>("get_voice_hold_hotkey");
+  return invoke<VoiceHotkeySettings>("get_voice_hold_hotkey");
 }
 
-export async function setVoiceHoldHotkey(hotkey: KeyChord | null): Promise<KeyChord | null> {
+export async function setVoiceHoldHotkey(
+  hotkey: VoiceHotkeySettings,
+): Promise<VoiceHotkeySettings> {
   if (!isTauriRuntime()) {
-    throw new Error("当前是浏览器预览，无法保存按住说话快捷键");
+    throw new Error("当前是浏览器预览，无法保存语音输入快捷键");
   }
-  return invoke<KeyChord | null>("set_voice_hold_hotkey", { hotkey });
+  return invoke<VoiceHotkeySettings>("set_voice_hold_hotkey", { hotkey });
 }
 
 /** 检查应用更新；浏览器预览下返回"无更新"占位（不发起网络请求）。 */
@@ -752,6 +776,16 @@ function voiceHotkeyKeyLabel(code: string): string {
 export function voiceHoldHotkeyLabel(hotkey: KeyChord | null): string {
   if (!hotkey || hotkey.keys.length === 0) return "关闭";
   return hotkey.keys.map(voiceHotkeyKeyLabel).join(" + ");
+}
+
+export function voiceHotkeyModeLabel(mode: VoiceHotkeyMode): string {
+  return mode === "toggle" ? "单次触发" : "按住说话";
+}
+
+/** 设置摘要：关闭时只显示"关闭"，否则"快捷键 · 形态"。 */
+export function voiceHotkeySummary(settings: VoiceHotkeySettings | null): string {
+  if (!settings?.chord || settings.chord.keys.length === 0) return "关闭";
+  return `${voiceHoldHotkeyLabel(settings.chord)} · ${voiceHotkeyModeLabel(settings.mode)}`;
 }
 
 export function connectionPhaseLabel(phase: ConnectionPhase): string {
@@ -916,6 +950,66 @@ export function keyLabel(code: KeyCode): string {
 
 export function chordLabel(chord: KeyChord): string {
   return chord.keys.map(keyLabel).join(" + ");
+}
+
+/** 快捷键录入用的修饰键集合（按左右区分，与 KeyCode 一致）。 */
+export const MODIFIER_KEY_CODES: readonly KeyCode[] = [
+  "left_control",
+  "right_control",
+  "left_shift",
+  "right_shift",
+  "left_alt",
+  "right_alt",
+  "left_windows",
+  "right_windows",
+];
+
+export function isModifierKeyCode(code: KeyCode): boolean {
+  return MODIFIER_KEY_CODES.includes(code);
+}
+
+/** KeyboardEvent.code → KeyCode（serde snake_case）；不认识的键返回 null。 */
+export function domCodeToKeyCode(code: string): KeyCode | null {
+  const modifierMap: Record<string, KeyCode> = {
+    ControlLeft: "left_control",
+    ControlRight: "right_control",
+    ShiftLeft: "left_shift",
+    ShiftRight: "right_shift",
+    AltLeft: "left_alt",
+    AltRight: "right_alt",
+    MetaLeft: "left_windows",
+    MetaRight: "right_windows",
+  };
+  if (modifierMap[code]) return modifierMap[code];
+  const named: Record<string, KeyCode> = {
+    Enter: "enter",
+    Space: "space",
+    Tab: "tab",
+    Backspace: "backspace",
+    Escape: "escape",
+    ArrowLeft: "left",
+    ArrowUp: "up",
+    ArrowRight: "right",
+    ArrowDown: "down",
+    Home: "home",
+    End: "end",
+    PageUp: "page_up",
+    PageDown: "page_down",
+    Insert: "insert",
+    Delete: "delete",
+    ContextMenu: "apps",
+    VolumeMute: "volume_mute",
+    VolumeUp: "volume_up",
+    VolumeDown: "volume_down",
+  };
+  if (named[code]) return named[code];
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1].toLowerCase();
+  const digit = /^Digit([0-9])$/.exec(code);
+  if (digit) return `digit${digit[1]}`;
+  const functionKey = /^F([1-9]|1[0-2])$/.exec(code);
+  if (functionKey) return `f${functionKey[1]}`;
+  return null;
 }
 
 /** 预设应用显示名（页面加载 listPresetApps 后更新；测试可注入）。 */

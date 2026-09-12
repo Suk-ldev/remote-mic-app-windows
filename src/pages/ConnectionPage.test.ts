@@ -1,6 +1,13 @@
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AudioEndpoint, AudioSnapshot, ConnectionSnapshot, RuntimeSnapshot } from "../lib/bridge";
+import type {
+  AudioEndpoint,
+  AudioSnapshot,
+  ConnectionSnapshot,
+  RuntimeSnapshot,
+  ShortcutCaptureEdge,
+  VoiceHotkeySettings,
+} from "../lib/bridge";
 import ConnectionPage from "./ConnectionPage.vue";
 
 const emptyConnection: ConnectionSnapshot = {
@@ -70,11 +77,17 @@ const cableEndpoint: AudioEndpoint = {
 
 const mocks = vi.hoisted(() => ({
   endpoints: [] as AudioEndpoint[],
+  captureHandler: null as ((edge: ShortcutCaptureEdge) => void) | null,
   getConnectionSnapshot: vi.fn(),
   getAudioSnapshot: vi.fn(),
   listAudioEndpoints: vi.fn(),
   selectAudioEndpoint: vi.fn(),
   openVbCableDownloadPage: vi.fn(),
+  getVoiceHoldHotkey: vi.fn(),
+  setVoiceHoldHotkey: vi.fn(),
+  startShortcutCapture: vi.fn(),
+  stopShortcutCapture: vi.fn(),
+  subscribeShortcutCaptureEdges: vi.fn(),
 }));
 
 vi.mock("../lib/bridge", async (importOriginal) => {
@@ -86,6 +99,11 @@ vi.mock("../lib/bridge", async (importOriginal) => {
     listAudioEndpoints: mocks.listAudioEndpoints,
     selectAudioEndpoint: mocks.selectAudioEndpoint,
     openVbCableDownloadPage: mocks.openVbCableDownloadPage,
+    getVoiceHoldHotkey: mocks.getVoiceHoldHotkey,
+    setVoiceHoldHotkey: mocks.setVoiceHoldHotkey,
+    startShortcutCapture: mocks.startShortcutCapture,
+    stopShortcutCapture: mocks.stopShortcutCapture,
+    subscribeShortcutCaptureEdges: mocks.subscribeShortcutCaptureEdges,
   };
 });
 
@@ -102,6 +120,12 @@ describe("VB-CABLE first-launch guidance", () => {
       selectedEndpointName: cableEndpoint.name,
     }));
     mocks.openVbCableDownloadPage.mockResolvedValue(undefined);
+    mocks.getVoiceHoldHotkey.mockResolvedValue({
+      chord: { keys: ["left_control", "left_windows"] },
+      mode: "hold",
+      activateWetype: true,
+    });
+    mocks.setVoiceHoldHotkey.mockImplementation(async (hotkey: VoiceHotkeySettings) => hotkey);
   });
 
   afterEach(() => {
@@ -174,5 +198,174 @@ describe("VB-CABLE first-launch guidance", () => {
     await flushPromises();
     expect(mocks.openVbCableDownloadPage).toHaveBeenCalledOnce();
     wrapper.unmount();
+  });
+});
+
+describe("语音输入快捷键设置", () => {
+  const wechatHotkey: VoiceHotkeySettings = {
+    chord: { keys: ["left_control", "left_windows"] },
+    mode: "hold",
+    activateWetype: true,
+  };
+
+  function findButton(wrapper: VueWrapper, label: string) {
+    const button = wrapper.findAll("button").find((candidate) => candidate.text() === label);
+    if (!button) throw new Error(`找不到按钮：${label}`);
+    return button;
+  }
+
+  beforeEach(() => {
+    mocks.endpoints = [cableEndpoint];
+    mocks.getConnectionSnapshot.mockResolvedValue(emptyConnection);
+    mocks.getAudioSnapshot.mockResolvedValue(emptyAudio);
+    mocks.listAudioEndpoints.mockImplementation(async () => mocks.endpoints);
+    mocks.selectAudioEndpoint.mockResolvedValue(emptyAudio);
+    mocks.getVoiceHoldHotkey.mockResolvedValue(wechatHotkey);
+    mocks.setVoiceHoldHotkey.mockImplementation(async (hotkey: VoiceHotkeySettings) => hotkey);
+    mocks.startShortcutCapture.mockResolvedValue(undefined);
+    mocks.stopShortcutCapture.mockResolvedValue(undefined);
+    mocks.captureHandler = null;
+    mocks.subscribeShortcutCaptureEdges.mockImplementation(
+      async (handler: (edge: ShortcutCaptureEdge) => void) => {
+        mocks.captureHandler = handler;
+        return () => {
+          mocks.captureHandler = null;
+        };
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("shows the saved shortcut and its trigger mode", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("语音输入快捷键");
+    expect(wrapper.text()).toContain("左 Ctrl + 左 Win");
+    expect(wrapper.text()).toContain("按住说话");
+    wrapper.unmount();
+  });
+
+  it("switches to single-trigger mode without losing the configured chord", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "单次触发").trigger("click");
+    await flushPromises();
+
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["left_control", "left_windows"] },
+      mode: "toggle",
+      activateWetype: true,
+    });
+    expect(wrapper.text()).toContain("单次触发");
+    wrapper.unmount();
+  });
+
+  it("applies the Windows voice preset as a single-trigger chord without IME switching", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "Windows 语音输入").trigger("click");
+    await flushPromises();
+
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["left_windows", "h"] },
+      mode: "toggle",
+      activateWetype: false,
+    });
+    wrapper.unmount();
+  });
+
+  // Typeless 等工具常用纯修饰键快捷键（右 Alt）：录入不能要求"终止键"，
+  // 全部松开即提交。
+  it("captures a modifier-only custom shortcut and saves it on release", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "录入自定义按键").trigger("click");
+    await flushPromises();
+    expect(mocks.startShortcutCapture).toHaveBeenCalledOnce();
+
+    mocks.captureHandler?.({ key: "right_alt", isPressed: true });
+    await flushPromises();
+    expect(wrapper.text()).toContain("右 Alt");
+
+    mocks.captureHandler?.({ key: "right_alt", isPressed: false });
+    await flushPromises();
+
+    expect(mocks.stopShortcutCapture).toHaveBeenCalled();
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: true,
+    });
+    expect(wrapper.text()).toContain("语音输入快捷键已录入：右 Alt");
+    wrapper.unmount();
+  });
+
+  it("keeps the whole combination pressed during capture, not just the last key", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "录入自定义按键").trigger("click");
+    await flushPromises();
+
+    mocks.captureHandler?.({ key: "left_control", isPressed: true });
+    mocks.captureHandler?.({ key: "left_shift", isPressed: true });
+    mocks.captureHandler?.({ key: "f5", isPressed: true });
+    mocks.captureHandler?.({ key: "f5", isPressed: false });
+    mocks.captureHandler?.({ key: "left_shift", isPressed: false });
+    await flushPromises();
+    expect(mocks.setVoiceHoldHotkey).not.toHaveBeenCalled();
+
+    mocks.captureHandler?.({ key: "left_control", isPressed: false });
+    await flushPromises();
+
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["left_control", "left_shift", "f5"] },
+      mode: "hold",
+      activateWetype: true,
+    });
+    wrapper.unmount();
+  });
+
+  // 原生钩子之外，录入还接 window 捕获阶段的键盘事件（不依赖元素焦点）。
+  it("also accepts capture edges from window keyboard events", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "录入自定义按键").trigger("click");
+    await flushPromises();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { code: "AltRight" }));
+    await flushPromises();
+    expect(wrapper.text()).toContain("右 Alt");
+
+    window.dispatchEvent(new KeyboardEvent("keyup", { code: "AltRight" }));
+    await flushPromises();
+
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: true,
+    });
+    wrapper.unmount();
+  });
+
+  it("releases the native capture hook when the page unmounts mid-capture", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "录入自定义按键").trigger("click");
+    await flushPromises();
+
+    wrapper.unmount();
+    await flushPromises();
+    expect(mocks.stopShortcutCapture).toHaveBeenCalled();
+    expect(mocks.captureHandler).toBeNull();
   });
 });

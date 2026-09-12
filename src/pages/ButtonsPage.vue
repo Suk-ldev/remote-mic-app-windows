@@ -7,12 +7,14 @@ import {
   buttonLabels,
   buttonTriggerLabel,
   chordLabel,
+  domCodeToKeyCode,
   exportButtonMappingConfiguration,
   getButtonMappingSnapshot,
   getButtonMappings,
   identityShortcutByButton,
   importButtonMappingConfiguration,
   listPresetApps,
+  MODIFIER_KEY_CODES,
   pickCustomApp,
   registerPresetAppNames,
   resetButtonMappings,
@@ -476,62 +478,9 @@ async function importConfiguration(): Promise<void> {
   }
 }
 
-/** KeyboardEvent.code → KeyCode（serde snake_case）。 */
-function codeToKeyCode(code: string): KeyCode | null {
-  const modifierMap: Record<string, KeyCode> = {
-    ControlLeft: "left_control",
-    ControlRight: "right_control",
-    ShiftLeft: "left_shift",
-    ShiftRight: "right_shift",
-    AltLeft: "left_alt",
-    AltRight: "right_alt",
-    MetaLeft: "left_windows",
-    MetaRight: "right_windows",
-  };
-  if (modifierMap[code]) return modifierMap[code];
-  const named: Record<string, KeyCode> = {
-    Enter: "enter",
-    Space: "space",
-    Tab: "tab",
-    Backspace: "backspace",
-    Escape: "escape",
-    ArrowLeft: "left",
-    ArrowUp: "up",
-    ArrowRight: "right",
-    ArrowDown: "down",
-    Home: "home",
-    End: "end",
-    PageUp: "page_up",
-    PageDown: "page_down",
-    Insert: "insert",
-    Delete: "delete",
-    ContextMenu: "apps",
-    VolumeMute: "volume_mute",
-    VolumeUp: "volume_up",
-    VolumeDown: "volume_down",
-  };
-  if (named[code]) return named[code];
-  const letter = /^Key([A-Z])$/.exec(code);
-  if (letter) return letter[1].toLowerCase();
-  const digit = /^Digit([0-9])$/.exec(code);
-  if (digit) return `digit${digit[1]}`;
-  const functionKey = /^F([1-9]|1[0-2])$/.exec(code);
-  if (functionKey) return `f${functionKey[1]}`;
-  return null;
-}
-
 const selectedCaptureModifiers = reactive(new Set<KeyCode>());
 const pressedCaptureModifiers = new Set<KeyCode>();
-const MODIFIER_KEYS = new Set<KeyCode>([
-  "left_control",
-  "right_control",
-  "left_shift",
-  "right_shift",
-  "left_alt",
-  "right_alt",
-  "left_windows",
-  "right_windows",
-]);
+const MODIFIER_KEYS = new Set<KeyCode>(MODIFIER_KEY_CODES);
 const CAPTURE_MODIFIER_OPTIONS: Array<{ key: KeyCode; label: string }> = [
   { key: "left_control", label: "左 Ctrl" },
   { key: "left_shift", label: "左 Shift" },
@@ -650,14 +599,14 @@ function handleCaptureKeydown(event: KeyboardEvent): void {
   if (!capturingShortcut.value) return;
   event.preventDefault();
   event.stopPropagation();
-  const code = codeToKeyCode(event.code);
+  const code = domCodeToKeyCode(event.code);
   if (code === null) return;
   acceptCapturedKey(code, true, event.repeat);
 }
 
 function handleCaptureKeyup(event: KeyboardEvent): void {
   if (!capturingShortcut.value) return;
-  const code = codeToKeyCode(event.code);
+  const code = domCodeToKeyCode(event.code);
   if (code) acceptCapturedKey(code, false);
 }
 
