@@ -55,7 +55,10 @@ jobs:
 
       - name: Generate updater manifest and stage release assets
         shell: pwsh
-        run: ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME
+        # -Repository 必须显式传入当前仓库：脚本默认值是上游仓库，分支仓库
+        # 若不传，latest.json 里的下载直链会指向上游的 Release（本仓库的
+        # 更新包永远取不到）。
+        run: ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME -Repository $env:GITHUB_REPOSITORY
 
       - name: Show staged assets before release (delete-free verification)
         shell: pwsh

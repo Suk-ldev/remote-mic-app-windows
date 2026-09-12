@@ -109,7 +109,11 @@ jobs:
         timeout-minutes: 10
         run: ./scripts/test-windows-silent-install.ps1
 
+      # 本仓库（个人分支）的 Actions 存储额度已用尽：上传失败不应让整条
+      # 验证流水线变红——安装包的正式交付走 windows-release.yml 的 Release
+      # 资产（不占 Actions 存储）。额度恢复后本步骤会自动重新产出 artifact。
       - name: Upload unsigned preview installer
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: sayall-windows-unsigned-preview-${{ github.sha }}
