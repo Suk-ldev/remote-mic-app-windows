@@ -115,7 +115,9 @@ export const disabledVoiceHotkey = (): VoiceHotkeySettings => ({
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
-  | { type: "open_app"; target: string };
+  | { type: "open_app"; target: string }
+  /** 透传该键的原生 Windows 动作（上→方向上、确定→回车 等）。 */
+  | { type: "native" };
 
 /** 预设应用条目（list_preset_apps 返回；对齐 Mac PresetApplication）。 */
 export interface PresetAppInfo {
@@ -865,6 +867,33 @@ export const identityShortcutByButton: Partial<Record<RemoteButton, KeyCode>> = 
   home: "home",
 };
 
+/**
+ * 拥有"原生 Windows 动作"的按键：逐项镜像 Rust `native_key`（同一张表，
+ * 便于对照核查），这些键可选"原生按键（透传）"动作——轻按注入其原生键。
+ * 返回/电源/TV 没有原生键，不提供该选项（Rust 侧归一化也会把它们的
+ * `native` 降级为禁用）。
+ *
+ * 注意：本集合只回答"有没有原生键"，不回答"编辑器里能不能配"——后者由
+ * ButtonsPage 的 `UNMAPPABLE_BUTTONS`（返回/音量±）单独决定。音量± 虽有
+ * 原生键但全型号禁用映射，静音不在遥控器按键布局里，二者都到不了编辑器。
+ */
+export const buttonsWithNativeKey: ReadonlySet<RemoteButton> = new Set<RemoteButton>([
+  "ok",
+  "home",
+  "up",
+  "down",
+  "left",
+  "right",
+  "menu",
+  "volume_mute",
+  "volume_up",
+  "volume_down",
+]);
+
+export function buttonHasNativeKey(button: RemoteButton): boolean {
+  return buttonsWithNativeKey.has(button);
+}
+
 export type ShortcutCapability = "all" | "identity" | "none";
 
 /**
@@ -1024,6 +1053,7 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "native") return "原生按键";
   if (action.type === "open_app") {
     const known = presetAppNames.get(action.target);
     if (known) return `打开${known}`;

@@ -610,9 +610,16 @@ fn fire_gesture(
     // 语义与连发。标记在此消费，对冲只作用于本次按住的首个 Single。
     if native_pending.remove(&button) {
         if trigger == ButtonTrigger::Single {
-            let native_covers = matches!(&action, ButtonAction::Shortcut { chord }
-                if chord.keys.len() == 1
-                    && native_key(button).is_some_and(|native| chord.keys[0] == native));
+            let native_covers = match &action {
+                // 显式原生透传：原生动作就是它本身，泄漏即已交付。
+                ButtonAction::Native => native_key(button).is_some(),
+                // 单键快捷键恰好等于原生动作（右→右 等）。
+                ButtonAction::Shortcut { chord } => {
+                    chord.keys.len() == 1
+                        && native_key(button).is_some_and(|native| chord.keys[0] == native)
+                }
+                _ => false,
+            };
             if native_covers {
                 crate::ble::gatt_note(format!(
                     "map_skip_inject reason=native_covers_action button={:?} trigger=single",
@@ -648,6 +655,32 @@ fn fire_gesture(
                 }
             }
         }
+        ButtonAction::Native => match native_key(button) {
+            Some(key) => {
+                let chord = KeyChord { keys: vec![key] };
+                crate::ble::gatt_note(format!(
+                    "map_fire button={:?} trigger={:?} action=native key={:?}",
+                    button, trigger, key
+                ));
+                match injector.tap(&chord) {
+                    Ok(()) => {
+                        crate::ble::gatt_note("map_inject result=ok kind=native".to_owned());
+                    }
+                    Err(error) => {
+                        crate::ble::gatt_note("map_inject result=err kind=native error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+                        lock_state(state).last_error = Some(format!("注入原生按键失败：{error}"));
+                    }
+                }
+            }
+            None => {
+                // 无原生键的按键（返回/电源/TV）不应到达此处（归一化已降级），
+                // 兜底记录并跳过。
+                crate::ble::gatt_note(format!(
+                    "map_skip_inject reason=no_native_key button={:?} trigger={:?}",
+                    button, trigger
+                ));
+            }
+        },
         ButtonAction::OpenApp { target } => {
             let target_kind = if target.contains('\\') || target.contains('/') {
                 "custom"

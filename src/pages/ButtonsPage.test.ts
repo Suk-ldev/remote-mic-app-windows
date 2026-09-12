@@ -515,4 +515,33 @@ describe("buttons mapping page", () => {
       expect(wrapper.find(".mapping-editor").exists()).toBe(false);
     }
   });
+
+  it("原生按键（透传）：有原生键的按键可配并即时保存，无原生键的不提供该选项", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "上", 0);
+    expect(chipState(wrapper, "原生按键（透传）")).toBe(false);
+
+    const nativeChip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((chip) => chip.text().includes("原生按键（透传）"));
+    await nativeChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) {
+        throw new Error("自动保存未触发");
+      }
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { single: { type: string } }>;
+    };
+    expect(saved.actions.up!.single.type).toBe("native");
+    expect(nativeChip!.classes()).toContain("selected");
+
+    // TV 没有原生键（native_key 返回 None）：编辑器不提供该 chip。
+    await openCell(wrapper, "TV", 0);
+    expect(
+      wrapper
+        .findAll(".mapping-editor .chip")
+        .some((chip) => chip.text().includes("原生按键（透传）")),
+    ).toBe(false);
+  });
 });

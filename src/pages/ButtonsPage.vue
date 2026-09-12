@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import {
   actionSummary,
+  buttonHasNativeKey,
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
@@ -397,6 +398,10 @@ function isActivePreset(keys: KeyCode[]): boolean {
  * 单响应；确定/方向的同键映射仍由泄漏对冲保证单响应，其余配置冷首按附带
  * 一次原生动作（结构性泄漏）。
  */
+const editorButtonHasNative = computed(() =>
+  editingTarget.value ? buttonHasNativeKey(editingTarget.value.button) : false,
+);
+
 const capabilityNote = computed<string | null>(() => {
   if (!editingTarget.value) return null;
   const button = editingTarget.value.button;
@@ -939,6 +944,20 @@ onUnmounted(() => {
       </div>
       <div class="action-sections">
         <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
+        <section v-if="editorButtonHasNative" class="action-section">
+          <h4 class="action-section-title">原生按键</h4>
+          <div class="preset-grid">
+            <button
+              class="chip"
+              :class="{ selected: actionOf(editingTarget.button, editingTarget.trigger).type === 'native' }"
+              type="button"
+              title="轻按透传该键的原生 Windows 动作（如 上→方向上）。与长按/双击的快捷键可共存：轻按走原生、长按走快捷键。"
+              @click="applyAction({ type: 'native' })"
+            >
+              原生按键（透传）
+            </button>
+          </div>
+        </section>
         <section v-for="group in PRESET_GROUPS" :key="group.label" class="action-section">
           <h4 class="action-section-title">{{ group.label }}</h4>
           <div class="preset-grid">

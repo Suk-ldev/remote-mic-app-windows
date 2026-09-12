@@ -258,6 +258,11 @@ pub enum ButtonAction {
     OpenApp {
         target: String,
     },
+    /// 透传该键的原生 Windows 动作（如 上→方向上、确定→回车）：轻按注入
+    /// [`native_key`] 返回的原生键，让"轻按走原生、长按/双击走快捷键"成为
+    /// 可配置组合。对无原生键的按键（返回/电源/TV，[`native_key`] 返回
+    /// None）无意义，持久化归一化时降级为 [`ButtonAction::Disabled`]。
+    Native,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -402,10 +407,15 @@ impl ButtonMappings {
 
     pub fn normalized(self) -> Result<Self, SendInputError> {
         let mut this = self.without_unsupported_buttons();
-        for actions in this.actions.values_mut() {
+        for (button, actions) in this.actions.iter_mut() {
+            // 无原生键的按键（返回/电源/TV）配了"原生透传"没有意义：降级为
+            // 禁用，与 UI 不提供该选项一致（fail closed，不留死配置）。
+            let has_native = native_key(*button).is_some();
             for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
-                if let ButtonAction::Shortcut { chord } = action {
-                    *chord = chord.clone().validated()?;
+                match action {
+                    ButtonAction::Shortcut { chord } => *chord = chord.clone().validated()?,
+                    ButtonAction::Native if !has_native => *action = ButtonAction::Disabled,
+                    _ => {}
                 }
             }
         }
@@ -774,6 +784,74 @@ mod tests {
         assert!(chord(&[KeyCode::L, KeyCode::RightWindows]).is_lock_workstation());
         assert!(!chord(&[KeyCode::LeftWindows, KeyCode::D]).is_lock_workstation());
         assert!(!chord(&[KeyCode::LeftWindows, KeyCode::Shift, KeyCode::L]).is_lock_workstation());
+    }
+
+    #[test]
+    fn native_action_round_trips_and_normalizes_by_native_availability() {
+        use crate::raw_input::RemoteButton;
+
+        // Up 有原生键：Native 保留。
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Up,
+            ButtonActions {
+                single: ButtonAction::Native,
+                double: ButtonAction::Disabled,
+                long: ButtonAction::Shortcut {
+                    chord: KeyChord {
+                        keys: vec![KeyCode::LeftControl, KeyCode::LeftShift, KeyCode::W],
+                    },
+                },
+            },
+        );
+        // TV 无原生键：Native 归一化降级为 Disabled。
+        mappings.actions.insert(
+            RemoteButton::Tv,
+            ButtonActions {
+                single: ButtonAction::Native,
+                double: ButtonAction::Disabled,
+                long: ButtonAction::Disabled,
+            },
+        );
+
+        let encoded = serde_json::to_string(&mappings).unwrap();
+        assert!(encoded.contains("\"native\""));
+        let decoded: ButtonMappings = serde_json::from_str(&encoded).unwrap();
+        let normalized = decoded.normalized().unwrap();
+
+        assert_eq!(
+            normalized.action_for(RemoteButton::Up, ButtonTrigger::Single),
+            ButtonAction::Native
+        );
+        assert_eq!(
+            normalized.action_for(RemoteButton::Up, ButtonTrigger::Long),
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::LeftControl, KeyCode::LeftShift, KeyCode::W],
+                }
+            }
+        );
+        // TV 的 Native 被降级为 Disabled（无原生键，fail closed）。
+        assert_eq!(
+            normalized.action_for(RemoteButton::Tv, ButtonTrigger::Single),
+            ButtonAction::Disabled
+        );
+    }
+
+    #[test]
+    fn native_action_marks_button_as_configured_for_gate() {
+        use crate::raw_input::RemoteButton;
+        // 配了 Native 的键必须计入 mapped_mask（门控要吞掉原生键才能受控注入）。
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Up,
+            ButtonActions {
+                single: ButtonAction::Native,
+                ..ButtonActions::default()
+            },
+        );
+        let mask = mappings.mapped_mask();
+        assert_ne!(mask & (1u64 << RemoteButton::Up.ordinal()), 0);
     }
 
     #[test]

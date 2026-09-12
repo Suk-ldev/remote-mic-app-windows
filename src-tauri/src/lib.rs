@@ -1,7 +1,7 @@
 use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::send_input::{
-    ButtonAction, ButtonMappings, ButtonTrigger, SendInputSnapshot, VoiceHotkeySettings,
+    ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot, VoiceHotkeySettings,
 };
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformSnapshot,
@@ -376,18 +376,20 @@ async fn import_button_mapping_configuration(
 fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut shortcut_count = 0_usize;
     let mut open_app_count = 0_usize;
+    let mut native_count = 0_usize;
     let mut disabled_count = 0_usize;
     for actions in mappings.actions.values() {
         for action in [&actions.single, &actions.double, &actions.long] {
             match action {
                 ButtonAction::Shortcut { .. } => shortcut_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
+                ButtonAction::Native => native_count += 1,
                 ButtonAction::Disabled => disabled_count += 1,
             }
         }
     }
     format!(
-        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} disabled_cell_count={disabled_count}",
+        "enabled={} button_count={} shortcut_count={shortcut_count} open_app_count={open_app_count} native_count={native_count} disabled_cell_count={disabled_count}",
         mappings.enabled,
         mappings.actions.len()
     )
@@ -406,6 +408,15 @@ async fn test_button_mapping(
             tauri::async_runtime::spawn_blocking(move || platform.test_shortcut(chord))
                 .await
                 .map_err(|error| format!("测试快捷键任务失败：{error}"))?
+                .map_err(|error| error.to_string())
+        }
+        ButtonAction::Native => {
+            let chord = sayall_windows::send_input::native_key(button)
+                .map(|key| KeyChord { keys: vec![key] })
+                .ok_or_else(|| "该按键没有可透传的原生动作".to_owned())?;
+            tauri::async_runtime::spawn_blocking(move || platform.test_shortcut(chord))
+                .await
+                .map_err(|error| format!("测试原生按键任务失败：{error}"))?
                 .map_err(|error| error.to_string())
         }
         ButtonAction::OpenApp { target } => tauri::async_runtime::spawn_blocking(move || {
