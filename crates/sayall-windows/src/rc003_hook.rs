@@ -164,9 +164,7 @@ fn run(
                 }
                 Err(error) => {
                     next_attempt = Instant::now() + FAILURE_COOLDOWN;
-                    gatt_note(format!(
-                        "rc003_hook spawn_failed error={error} backoff=15s"
-                    ));
+                    gatt_note(format!("rc003_hook spawn_failed error={error} backoff=15s"));
                 }
             }
         } else if !want {

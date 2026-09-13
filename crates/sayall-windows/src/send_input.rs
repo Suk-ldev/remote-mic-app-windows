@@ -388,25 +388,14 @@ impl<'de> serde::Deserialize<'de> for ButtonMappings {
 }
 
 impl ButtonMappings {
-    /// 策略性不支持自定义的按键（全型号一致）：
-    /// - 返回/音量±：RC003 输入栈不可见（配置无法生效）；RC001 虽以
-    ///   VK 0xFF 厂商键可达且可直接归因，为保持两型号行为一致而不开放。
+    /// 校验并归一化按键映射：快捷键和弦逐个校验；无原生键的按键
+    /// （返回/电源/TV）配"原生透传"降级为禁用，与 UI 不提供该选项一致
+    /// （fail closed，不留死配置）。
     ///
-    /// 持久化层（[`Self::normalized`]）与引擎层（button_mapping 的
-    /// `set_mappings`）双重剥离，存量配置在加载/保存时自动清除。
-    pub(crate) fn without_unsupported_buttons(mut self) -> Self {
-        for button in [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ] {
-            self.actions.remove(&button);
-        }
-        self
-    }
-
+    /// 返回/音量± 自 2026-09-13 起开放自定义：RC003 经 WUDFHost 钩子投递
+    /// 边沿（rc003_hook），RC001 以 VK 0xFF 厂商键原生可达（raw_input）。
     pub fn normalized(self) -> Result<Self, SendInputError> {
-        let mut this = self.without_unsupported_buttons();
+        let mut this = self;
         for (button, actions) in this.actions.iter_mut() {
             // 无原生键的按键（返回/电源/TV）配了"原生透传"没有意义：降级为
             // 禁用，与 UI 不提供该选项一致（fail closed，不留死配置）。
@@ -1246,9 +1235,9 @@ mod tests {
     }
 
     #[test]
-    fn normalized_strips_unsupported_button_customization() {
-        // 策略性不支持的按键：normalized() 在持久化层剥离返回/音量±配置；
-        // 左键自 2026-09-08 起与其余方向键同样允许映射，不得再被剥离。
+    fn normalized_keeps_back_and_volume_customization() {
+        // 返回/音量± 自 2026-09-13 起开放自定义（RC003 钩子投递、RC001 原生
+        // 可达），normalized() 不再剥离；返回无原生键，透传降级为禁用。
         let mut mappings = ButtonMappings::default();
         let single_escape = ButtonActions {
             single: ButtonAction::Shortcut {
@@ -1266,6 +1255,23 @@ mod tests {
         ] {
             mappings.actions.insert(button, single_escape.clone());
         }
+        mappings.actions.insert(
+            RemoteButton::Back,
+            ButtonActions {
+                single: ButtonAction::Native,
+                double: ButtonAction::Shortcut {
+                    chord: chord(&[KeyCode::Escape]),
+                },
+                ..ButtonActions::default()
+            },
+        );
+        mappings.actions.insert(
+            RemoteButton::VolumeUp,
+            ButtonActions {
+                single: ButtonAction::Native,
+                ..ButtonActions::default()
+            },
+        );
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
@@ -1286,14 +1292,29 @@ mod tests {
             RemoteButton::VolumeDown,
         ] {
             assert!(
-                !normalized.actions.contains_key(&button),
-                "{button:?} 自定义必须被策略剥离"
+                normalized.actions.contains_key(&button),
+                "{button:?} 自定义必须保留"
             );
         }
-        assert!(normalized.actions.contains_key(&RemoteButton::Tv));
-        assert_eq!(
-            normalized.mapped_mask(),
-            (1u64 << RemoteButton::Left.ordinal()) | (1u64 << RemoteButton::Tv.ordinal())
+        assert!(
+            normalized.actions.contains_key(&RemoteButton::Tv),
+            "TV 键映射必须保留"
         );
+        assert_eq!(
+            normalized.actions(RemoteButton::Back).single,
+            ButtonAction::Disabled,
+            "返回无原生键，透传降级为禁用"
+        );
+        assert_eq!(
+            normalized.actions(RemoteButton::VolumeUp).single,
+            ButtonAction::Native,
+            "音量+有媒体原生键，透传保留"
+        );
+        let expected_mask = (1u64 << RemoteButton::Left.ordinal())
+            | (1u64 << RemoteButton::Back.ordinal())
+            | (1u64 << RemoteButton::VolumeUp.ordinal())
+            | (1u64 << RemoteButton::VolumeDown.ordinal())
+            | (1u64 << RemoteButton::Tv.ordinal());
+        assert_eq!(normalized.mapped_mask(), expected_mask);
     }
 }

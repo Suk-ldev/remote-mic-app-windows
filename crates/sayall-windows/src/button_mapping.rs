@@ -213,9 +213,8 @@ impl ButtonMappingRuntime {
 
     /// 更新按键映射：热加载到引擎 + 同步门控吞键配置。
     pub fn set_mappings(&self, mappings: ButtonMappings) {
-        // 策略性不支持的按键（返回/音量±）统一
-        // 剥离：normalized() 已在持久化层剥离，此处兜底直连调用路径。
-        let mappings = mappings.without_unsupported_buttons();
+        // 返回/音量± 自 2026-09-13 起可映射：RC003 由 WUDFHost 钩子投递边沿、
+        // RC001 原生可达，不再剥离（见 rc003_hook 与调查归档 2026-09-13）。
         *self
             .mappings
             .write()
@@ -1261,8 +1260,9 @@ mod tests {
     }
 
     #[test]
-    fn set_mappings_strips_unsupported_buttons_and_sets_persistent_mask() {
-        // 返回/音量±仍被策略剥离；左键映射必须保留并进入普通逐键武装机制。
+    fn set_mappings_keeps_back_and_volume_buttons() {
+        // 返回/音量± 自 2026-09-13 起开放（RC003 钩子投递、RC001 原生可达）：
+        // 引擎不再剥离；左键映射保留并进入普通逐键武装机制。
         let runtime = ButtonMappingRuntime::new(
             Arc::new(RecordingInjector::default()) as Arc<dyn MappingInjector>,
             Arc::new(UsageCounters::default()),
@@ -1308,16 +1308,10 @@ mod tests {
             effective.actions.contains_key(&RemoteButton::Left),
             "左键自定义必须保留"
         );
-        for button in [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ] {
-            assert!(
-                !effective.actions.contains_key(&button),
-                "{button:?} 自定义必须被策略剥离"
-            );
-        }
+        assert!(
+            effective.actions.contains_key(&RemoteButton::Back),
+            "返回自定义必须保留（RC003 钩子投递边沿）"
+        );
         assert_eq!(
             effective
                 .actions
@@ -1337,10 +1331,13 @@ mod tests {
                 },
             },
         );
-        // 引擎侧被剥离按键的动作查询为 Disabled（双保险：配置剥离 + 查询兜底）。
         assert_eq!(
             effective.action_for(RemoteButton::Back, ButtonTrigger::Single),
-            ButtonAction::Disabled,
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Escape],
+                },
+            },
         );
     }
 }
