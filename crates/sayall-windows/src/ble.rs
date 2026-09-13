@@ -1693,6 +1693,38 @@ fn gatt_sink() -> Option<&'static Mutex<std::fs::File>> {
     .as_ref()
 }
 
+/// 诊断日志体积封顶：应用可长期自启动驻留，若一直向单文件追加会无限增长占盘。
+/// 每写若干条抽查一次当前大小，超过上限即先把现有内容复制成单个 `.1` 备份
+/// （覆盖旧备份，保留最近一整段历史供报障），再就地清空当前文件（沿用同一句柄，
+/// append 模式下后续写入自然从头开始）。磁盘占用因此最多约 2× 上限。全程尽力而
+/// 为，任何一步失败都不影响日志写入。抽查而非每次检查，避免流式期高频 metadata。
+fn maybe_rotate_diagnostic_log(file: &mut std::fs::File) {
+    use std::io::Seek as _;
+    use std::io::Write as _;
+    const MAX_BYTES: u64 = 5 * 1024 * 1024; // 单文件上限 5 MiB（+1 份备份≈10 MiB 封顶）
+    const CHECK_EVERY: u64 = 256;
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    if WRITES.fetch_add(1, Ordering::Relaxed) % CHECK_EVERY != 0 {
+        return;
+    }
+    let over_cap = file
+        .metadata()
+        .map(|meta| meta.len() > MAX_BYTES)
+        .unwrap_or(false);
+    if !over_cap {
+        return;
+    }
+    if let Some(path) = DIAGNOSTIC_LOG_PATH.get() {
+        let mut backup = path.clone().into_os_string();
+        backup.push(".1");
+        let _ = file.flush();
+        let _ = std::fs::copy(path, std::path::PathBuf::from(backup));
+    }
+    if file.set_len(0).is_ok() {
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+    }
+}
+
 fn gatt_log(kind: &str, bytes: &[u8]) {
     use std::io::Write as _;
     // 原始音频包既是高频数据又可能承载语音内容，生产诊断日志绝不落盘。
@@ -1702,6 +1734,7 @@ fn gatt_log(kind: &str, bytes: &[u8]) {
     }
     if let Some(sink) = gatt_sink() {
         if let Ok(mut file) = sink.lock() {
+            maybe_rotate_diagnostic_log(&mut file);
             let timestamp = utc_timestamp();
             let metadata = DIAGNOSTIC_LOG_METADATA.get();
             let preview: String = bytes
@@ -1737,6 +1770,7 @@ pub fn gatt_note(note: String) {
     use std::io::Write as _;
     if let Some(sink) = gatt_sink() {
         if let Ok(mut file) = sink.lock() {
+            maybe_rotate_diagnostic_log(&mut file);
             let timestamp = utc_timestamp();
             let metadata = DIAGNOSTIC_LOG_METADATA.get();
             let _ = writeln!(
