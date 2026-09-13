@@ -246,7 +246,32 @@ int wmain() {
         const ULONGLONG begun = GetTickCount64();
         while (shared->state != HS_Capturing && shared->state != HS_Failed &&
             WaitForSingleObject(worker.value, 0) == WAIT_TIMEOUT && GetTickCount64() - begun < 10000) Sleep(20);
-        Assert(shared->state == HS_Capturing, "hook_installed");
+        if (shared->state != HS_Capturing) {
+            // Localize the failing leg. state/magic separate a handshake failure
+            // (worker never mapped our section: state stays 0/Idle, magic still
+            // reads back ours) from a Detours failure (state=HS_Failed with
+            // hook_error set). worker_exit is RunHook's return value -- the real
+            // error code of the silent early-return paths (OpenFileMapping /
+            // MapViewOfFile / magic / pin) that never touch shared. A live worker
+            // reads back STILL_ACTIVE (259); report that as "running" so a genuine
+            // 259 error can't masquerade as a 10s timeout.
+            DWORD exit_code = 0;
+            const bool got = GetExitCodeThread(worker.value, &exit_code) != FALSE;
+            const bool running = got && exit_code == STILL_ACTIVE;
+            std::fprintf(stderr,
+                "stage=hook_installed result=failed win32=%lu state=%ld magic=0x%08lX hook_error=%ld worker=%s worker_exit=%lu threads_seen=%ld threads_updated=%ld threads_denied=%ld\n",
+                running ? 0u : exit_code,
+                static_cast<long>(shared->state), static_cast<unsigned long>(shared->magic),
+                static_cast<long>(shared->error), running ? "running" : "exited", exit_code,
+                static_cast<long>(shared->threads_seen), static_cast<long>(shared->threads_updated),
+                static_cast<long>(shared->threads_denied));
+            std::fflush(stderr);
+            throw std::runtime_error("hook_installed");
+        }
+        std::fprintf(stderr, "stage=hook_installed result=passed threads_seen=%ld threads_updated=%ld threads_denied=%ld\n",
+            static_cast<long>(shared->threads_seen), static_cast<long>(shared->threads_updated),
+            static_cast<long>(shared->threads_denied));
+        std::fflush(stderr);
         std::printf("ready\n");
 
         // Stream edges until the parent closes stdin (EOF -> request unhook) or

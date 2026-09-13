@@ -63,27 +63,43 @@ static LONG ChangeHook(bool install) {
     std::vector<HANDLE> threads;
     THREADENTRY32 entry{sizeof(entry)};
     LONG result = NO_ERROR;
+    LONG seen = 0, denied = 0;
     if (!Thread32First(snapshot, &entry)) result = static_cast<LONG>(GetLastError());
     else do {
         if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
             entry.th32ThreadID == GetCurrentThreadId()) continue;
+        ++seen;
         HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
             THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
         if (!thread) {
-            const DWORD error = GetLastError();
-            if (error == ERROR_INVALID_PARAMETER) continue;
-            result = static_cast<LONG>(error);
-            break;
+            // WUDFHost is a write-restricted LOCAL SERVICE process: it cannot open
+            // all of its OWN peer threads for SUSPEND/SET_CONTEXT (ERROR_ACCESS_DENIED),
+            // and a thread can also exit mid-enumeration (ERROR_INVALID_PARAMETER).
+            // Neither is fatal -- previously ACCESS_DENIED aborted the whole hook and
+            // it never installed. Skip the thread; we still fix up the calling thread
+            // below (pseudo-handle, no OpenThread), and Detours rewrites ntdll's 5-byte
+            // stub as one transaction, so an un-updated peer only matters in the
+            // vanishingly rare case its RIP sits inside those 5 bytes at commit.
+            ++denied;
+            continue;
         }
         threads.push_back(thread);
     } while (Thread32Next(snapshot, &entry));
     CloseHandle(snapshot);
+    if (shared) {
+        shared->threads_seen = seen;
+        shared->threads_denied = denied;
+        shared->threads_updated = static_cast<LONG>(threads.size());
+    }
     if (result == NO_ERROR) {
         result = DetourTransactionBegin();
         if (result == NO_ERROR) {
             result = install
                 ? DetourAttach(reinterpret_cast<PVOID*>(&real_ioctl), HookIoctl)
                 : DetourDetach(reinterpret_cast<PVOID*>(&real_ioctl), HookIoctl);
+            // Always fix up the calling thread; GetCurrentThread() is a pseudo-handle
+            // that needs no OpenThread and is immune to the write-restricted token.
+            if (result == NO_ERROR) result = DetourUpdateThread(GetCurrentThread());
             for (HANDLE thread : threads) {
                 if (result != NO_ERROR) break;
                 DWORD exit_code = 0;
