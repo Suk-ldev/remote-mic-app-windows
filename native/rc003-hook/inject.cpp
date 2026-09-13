@@ -231,8 +231,13 @@ int wmain() {
         shared->stop = 0;
         shared->state = HS_Idle;
 
+        // Stage a fresh, uniquely-named hook DLL and inject it. The DLL unloads
+        // itself on teardown (no pin), so it does not accumulate in the long-lived
+        // shared device-pool host; the unique name still avoids colliding on disk
+        // with a prior copy whose unload timed out and stayed resident.
         const std::wstring staged = StageDll(SourceDll());
         const std::wstring staged_base = Basename(staged);
+        const std::wstring staged_dir = staged.substr(0, staged.find_last_of(L"\\/"));
         LoadRemote(process.value, pid, staged, staged_base);
         // Resolve the hook's entry point in the remote and start its worker.
         HMODULE local = LoadLibraryExW(SourceDll().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -299,8 +304,16 @@ int wmain() {
             Sleep(8);
         }
         InterlockedExchange(&shared->stop, 1);
-        WaitForSingleObject(worker.value, 5000);
-        Emit("stream", "stopped", 0);
+        // On a clean stop the worker unloads the hook DLL before its thread exits,
+        // so once the thread is gone the staged copy on disk is no longer mapped
+        // and can be removed. If the worker didn't exit in time (a wedged drain
+        // left it resident), leave the file in place -- it may still be mapped.
+        const bool worker_gone = WaitForSingleObject(worker.value, 6000) == WAIT_OBJECT_0;
+        if (worker_gone) {
+            DeleteFileW(staged.c_str());
+            RemoveDirectoryW(staged_dir.c_str());
+        }
+        Emit("stream", worker_gone ? "stopped" : "worker_wedged", 0);
         return 0;
     } catch (const std::exception&) {
         return 1;
