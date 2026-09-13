@@ -44,6 +44,12 @@ jobs:
           }
           Write-Host "正式更新签名密钥已就绪"
 
+      - name: Build RC003 hook native components
+        # 注入器 + 钩子 DLL 必须先于 tauri build 产出（tauri.conf.json 的
+        # bundle.resources 引用 target/rc003-hook/ 下两个产物，缺失即打包失败）。
+        # Detours 源码从上游拉取并做 SHA256 校验，不安装任何软件。
+        run: ./scripts/build-rc003-hook.ps1 -FetchSources
+
       - name: Build signed NSIS installer
         run: pnpm tauri build --bundles nsis
         env:

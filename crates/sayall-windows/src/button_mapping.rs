@@ -213,9 +213,8 @@ impl ButtonMappingRuntime {
 
     /// 更新按键映射：热加载到引擎 + 同步门控吞键配置。
     pub fn set_mappings(&self, mappings: ButtonMappings) {
-        // 策略性不支持的按键（返回/音量±）统一
-        // 剥离：normalized() 已在持久化层剥离，此处兜底直连调用路径。
-        let mappings = mappings.without_unsupported_buttons();
+        // 返回/音量± 自 2026-09-13 起可映射：RC003 由 WUDFHost 钩子投递边沿、
+        // RC001 原生可达，不再剥离（见 rc003_hook 与调查归档 2026-09-13）。
         *self
             .mappings
             .write()
@@ -610,9 +609,16 @@ fn fire_gesture(
     // 语义与连发。标记在此消费，对冲只作用于本次按住的首个 Single。
     if native_pending.remove(&button) {
         if trigger == ButtonTrigger::Single {
-            let native_covers = matches!(&action, ButtonAction::Shortcut { chord }
-                if chord.keys.len() == 1
-                    && native_key(button).is_some_and(|native| chord.keys[0] == native));
+            let native_covers = match &action {
+                // 显式原生透传：原生动作就是它本身，泄漏即已交付。
+                ButtonAction::Native => native_key(button).is_some(),
+                // 单键快捷键恰好等于原生动作（右→右 等）。
+                ButtonAction::Shortcut { chord } => {
+                    chord.keys.len() == 1
+                        && native_key(button).is_some_and(|native| chord.keys[0] == native)
+                }
+                _ => false,
+            };
             if native_covers {
                 crate::ble::gatt_note(format!(
                     "map_skip_inject reason=native_covers_action button={:?} trigger=single",
@@ -648,6 +654,32 @@ fn fire_gesture(
                 }
             }
         }
+        ButtonAction::Native => match native_key(button) {
+            Some(key) => {
+                let chord = KeyChord { keys: vec![key] };
+                crate::ble::gatt_note(format!(
+                    "map_fire button={:?} trigger={:?} action=native key={:?}",
+                    button, trigger, key
+                ));
+                match injector.tap(&chord) {
+                    Ok(()) => {
+                        crate::ble::gatt_note("map_inject result=ok kind=native".to_owned());
+                    }
+                    Err(error) => {
+                        crate::ble::gatt_note("map_inject result=err kind=native error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+                        lock_state(state).last_error = Some(format!("注入原生按键失败：{error}"));
+                    }
+                }
+            }
+            None => {
+                // 无原生键的按键（返回/电源/TV）不应到达此处（归一化已降级），
+                // 兜底记录并跳过。
+                crate::ble::gatt_note(format!(
+                    "map_skip_inject reason=no_native_key button={:?} trigger={:?}",
+                    button, trigger
+                ));
+            }
+        },
         ButtonAction::OpenApp { target } => {
             let target_kind = if target.contains('\\') || target.contains('/') {
                 "custom"
@@ -1228,8 +1260,9 @@ mod tests {
     }
 
     #[test]
-    fn set_mappings_strips_unsupported_buttons_and_sets_persistent_mask() {
-        // 返回/音量±仍被策略剥离；左键映射必须保留并进入普通逐键武装机制。
+    fn set_mappings_keeps_back_and_volume_buttons() {
+        // 返回/音量± 自 2026-09-13 起开放（RC003 钩子投递、RC001 原生可达）：
+        // 引擎不再剥离；左键映射保留并进入普通逐键武装机制。
         let runtime = ButtonMappingRuntime::new(
             Arc::new(RecordingInjector::default()) as Arc<dyn MappingInjector>,
             Arc::new(UsageCounters::default()),
@@ -1275,16 +1308,10 @@ mod tests {
             effective.actions.contains_key(&RemoteButton::Left),
             "左键自定义必须保留"
         );
-        for button in [
-            RemoteButton::Back,
-            RemoteButton::VolumeUp,
-            RemoteButton::VolumeDown,
-        ] {
-            assert!(
-                !effective.actions.contains_key(&button),
-                "{button:?} 自定义必须被策略剥离"
-            );
-        }
+        assert!(
+            effective.actions.contains_key(&RemoteButton::Back),
+            "返回自定义必须保留（RC003 钩子投递边沿）"
+        );
         assert_eq!(
             effective
                 .actions
@@ -1304,10 +1331,13 @@ mod tests {
                 },
             },
         );
-        // 引擎侧被剥离按键的动作查询为 Disabled（双保险：配置剥离 + 查询兜底）。
         assert_eq!(
             effective.action_for(RemoteButton::Back, ButtonTrigger::Single),
-            ButtonAction::Disabled,
+            ButtonAction::Shortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Escape],
+                },
+            },
         );
     }
 }

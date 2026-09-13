@@ -435,11 +435,14 @@ mod tests {
     fn voice_hold_hotkey_round_trips_and_validates_chord() {
         use sayall_windows::send_input::VoiceHotkeyMode;
 
-        let store = SettingsStore::new(std::env::temp_dir().join(format!(
-            "sayall-test-voice-hold-{}.json",
-            std::process::id()
-        )));
-        let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+        // `voice_hold_hotkey_path()` 丢弃给定文件名、只取所在目录的兄弟文件，
+        // 所以按文件名区分的用例会落到 %TEMP% 下同一个 voice-hold-hotkey.json；
+        // 同进程内并行执行时互相覆盖。每个用例独占一个目录才真正隔离。
+        let base =
+            std::env::temp_dir().join(format!("sayall-test-voice-hold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(base.join("settings.json"));
 
         // 缺省文件 = 出厂默认（左 Ctrl + 左 Win 按住说话，微信输入法激活）
         let default = store.load_voice_hold_hotkey().unwrap();
@@ -481,7 +484,7 @@ mod tests {
         };
         assert!(store.save_voice_hold_hotkey(invalid).is_err());
 
-        let _ = std::fs::remove_file(store.voice_hold_hotkey_path());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// v1 文件（裸 Option<KeyChord>）必须保持原行为：按住说话 + 微信输入法
@@ -490,14 +493,14 @@ mod tests {
     fn legacy_voice_hold_hotkey_file_keeps_hold_and_wetype_activation() {
         use sayall_windows::send_input::VoiceHotkeyMode;
 
-        let store = SettingsStore::new(std::env::temp_dir().join(format!(
-            "sayall-test-voice-hold-legacy-{}.json",
+        let base = std::env::temp_dir().join(format!(
+            "sayall-test-voice-hold-legacy-{}",
             std::process::id()
-        )));
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let store = SettingsStore::new(base.join("settings.json"));
         let path = store.voice_hold_hotkey_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
         std::fs::write(&path, br#"{"keys":["left_control","left_windows"]}"#).unwrap();
 
         let loaded = store.load_voice_hold_hotkey().unwrap();
@@ -512,6 +515,6 @@ mod tests {
             VoiceHotkeySettings::disabled()
         );
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from
 import { reportFrontendEvent } from "../lib/frontend-diagnostics";
 import {
   actionSummary,
+  buttonHasNativeKey,
   buttonLabel,
   buttonLabels,
   buttonTriggerLabel,
@@ -99,17 +100,10 @@ const remoteModel = computed<RemoteModel>(
 );
 
 /**
- * 不支持自定义的按键（2026-09-07 用户决策，全型号一致）：
- * 返回/音量±——RC003 上不进 Windows 输入栈（配置无法生效，2026-09-05
- * 调查归档 docs/investigations/2026-09-05-rc003-back-volume-buttons-invisible.md）；
- * RC001 上虽以 VK 0xFF 厂商键可达且可直接归因，为保持两型号行为一致而
- * 不开放配置。存量配置由后端（settings 持久化层 + 映射引擎）双重剥离。
+ * 全部按键均可自定义。返回/音量±自 2026-09-13 起开放（RC003 经 WUDFHost
+ * 钩子投递边沿，见 docs/investigations/2026-09-13-rc003-wudfhost-tap-confirmed.md；
+ * RC001 以 VK 0xFF 厂商键直接归因可达）。
  */
-const UNMAPPABLE_BUTTONS: ReadonlySet<RemoteButton> = new Set<RemoteButton>([
-  "back",
-  "volume_up",
-  "volume_down",
-]);
 
 function anchorPoint(placement: Placement): { x: number; y: number } {
   return {
@@ -397,6 +391,10 @@ function isActivePreset(keys: KeyCode[]): boolean {
  * 单响应；确定/方向的同键映射仍由泄漏对冲保证单响应，其余配置冷首按附带
  * 一次原生动作（结构性泄漏）。
  */
+const editorButtonHasNative = computed(() =>
+  editingTarget.value ? buttonHasNativeKey(editingTarget.value.button) : false,
+);
+
 const capabilityNote = computed<string | null>(() => {
   if (!editingTarget.value) return null;
   const button = editingTarget.value.button;
@@ -878,11 +876,8 @@ onUnmounted(() => {
                 editingTarget?.button === placement.button && editingTarget?.trigger === trigger,
               flashed: firedFlash?.button === placement.button && firedFlash?.trigger === trigger,
             }"
-            :disabled="UNMAPPABLE_BUTTONS.has(placement.button)"
             :title="
-              UNMAPPABLE_BUTTONS.has(placement.button)
-                ? '此按键暂不支持自定义，按键功能保持原样'
-                : `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${actionSummary(actionOf(placement.button, trigger))}`
+              `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${actionSummary(actionOf(placement.button, trigger))}`
             "
             @click.stop="openEditor(placement.button, trigger)"
           >
@@ -939,6 +934,20 @@ onUnmounted(() => {
       </div>
       <div class="action-sections">
         <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
+        <section v-if="editorButtonHasNative" class="action-section">
+          <h4 class="action-section-title">原生按键</h4>
+          <div class="preset-grid">
+            <button
+              class="chip"
+              :class="{ selected: actionOf(editingTarget.button, editingTarget.trigger).type === 'native' }"
+              type="button"
+              title="轻按透传该键的原生 Windows 动作（如 上→方向上）。与长按/双击的快捷键可共存：轻按走原生、长按走快捷键。"
+              @click="applyAction({ type: 'native' })"
+            >
+              原生按键（透传）
+            </button>
+          </div>
+        </section>
         <section v-for="group in PRESET_GROUPS" :key="group.label" class="action-section">
           <h4 class="action-section-title">{{ group.label }}</h4>
           <div class="preset-grid">

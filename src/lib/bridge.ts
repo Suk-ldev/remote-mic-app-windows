@@ -115,7 +115,9 @@ export const disabledVoiceHotkey = (): VoiceHotkeySettings => ({
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
-  | { type: "open_app"; target: string };
+  | { type: "open_app"; target: string }
+  /** 透传该键的原生 Windows 动作（上→方向上、确定→回车 等）。 */
+  | { type: "native" };
 
 /** 预设应用条目（list_preset_apps 返回；对齐 Mac PresetApplication）。 */
 export interface PresetAppInfo {
@@ -865,6 +867,34 @@ export const identityShortcutByButton: Partial<Record<RemoteButton, KeyCode>> = 
   home: "home",
 };
 
+/**
+ * 拥有"原生 Windows 动作"的按键：逐项镜像 Rust `native_key`（同一张表，
+ * 便于对照核查），这些键可选"原生按键（透传）"动作——轻按注入其原生键。
+ * 返回/电源/TV 没有原生键，不提供该选项（Rust 侧归一化也会把它们的
+ * `native` 降级为禁用）。
+ *
+ * 注意：本集合只回答"有没有原生键"。返回/电源/TV 无原生键（配"原生
+ * 透传"会被后端归一化降级为禁用）；静音不在遥控器按键布局里，到不了
+ * 编辑器。返回/音量±自 2026-09-13 起开放自定义（RC003 钩子投递边沿、
+ * RC001 VK 0xFF 直接归因）。
+ */
+export const buttonsWithNativeKey: ReadonlySet<RemoteButton> = new Set<RemoteButton>([
+  "ok",
+  "home",
+  "up",
+  "down",
+  "left",
+  "right",
+  "menu",
+  "volume_mute",
+  "volume_up",
+  "volume_down",
+]);
+
+export function buttonHasNativeKey(button: RemoteButton): boolean {
+  return buttonsWithNativeKey.has(button);
+}
+
 export type ShortcutCapability = "all" | "identity" | "none";
 
 /**
@@ -872,14 +902,15 @@ export type ShortcutCapability = "all" | "identity" | "none";
  * examples/preset_inject_probe.rs 真机验证 36/36 全部正确——所有可见按键
  * 的所有配置均真实生效，本矩阵**只用于编辑器的信息提示**，不做门控）：
  *
- * - **all**（直接归因族：电源 VK 0xFF/0x5F、菜单 VK_APPS）：原始键
- *   从不泄漏 → 任意配置严格单响应；
+ * - **all**（零泄漏族）：电源 VK 0xFF/0x5F、菜单 VK_APPS——原始键从不
+ *   泄漏 → 任意配置严格单响应。返回/音量± 自 2026-09-13 起同属此族：
+ *   RC003 上厂商报文不进 OS 键盘栈（边沿由 WUDFHost 钩子投递，原始键
+ *   结构性不存在）；RC001 上以 VK 0xFF 厂商键直接归因吞键（无需武装，
+ *   不泄漏）。
  * - **identity**（武装族常见物理 VK：确定/方向）：孤立冷首按原始键
  *   必泄漏（结构性武装死锁，公开 API 内不可根除）→ 同键映射由泄漏对冲
  *   保证单响应，其他映射"配置动作正常执行 + 冷首按附带一次原生动作"；
- * - **none**：TV（OEM_3 `~/~，同键映射不可表达）与返回/音量±（RC003
- *   输入栈不可见；RC001 虽可达但 2026-09-07 起全型号禁用——格子禁用，
- *   见 ButtonsPage 的 UNMAPPABLE_BUTTONS）。
+ * - **none**：TV（OEM_3 `~/~，同键映射不可表达）。
  *
  * 2026-09-07 增补（方案 C"遥控器优先"落地，key_gate 常驻抑制族）：
  * Home/TV 已配置映射且遥控器连接期间原生按键被接管——任意按压（含孤立
@@ -892,16 +923,19 @@ export function shortcutCapability(
   trigger: ButtonTrigger,
   _model: RemoteModel,
 ): ShortcutCapability {
-  if (button === "power" || button === "menu") {
-    return "all";
-  }
   if (
+    button === "power" ||
+    button === "menu" ||
     button === "back" ||
     button === "volume_up" ||
-    button === "volume_down" ||
-    button === "tv"
+    button === "volume_down"
   ) {
-    // 返回/音量±全型号禁用（2026-09-07 用户决策）；TV 无同键映射可表达。
+    // 零泄漏族：电源/菜单（VK 直接归因）+ 返回/音量±（RC003 钩子投递、
+    // RC001 VK 0xFF 直接归因）。任意触发方式均严格单响应。
+    return "all";
+  }
+  if (button === "tv") {
+    // TV 无同键映射可表达。
     return "none";
   }
   // 武装族（确定/方向）：单击可配同键映射（对冲单响应）。
@@ -1024,6 +1058,7 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
 
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "native") return "原生按键";
   if (action.type === "open_app") {
     const known = presetAppNames.get(action.target);
     if (known) return `打开${known}`;

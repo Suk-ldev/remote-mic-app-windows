@@ -492,7 +492,7 @@ describe("buttons mapping page", () => {
     expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");
   });
 
-  it("返回/音量±全型号禁用（2026-09-07 用户决策：RC001 同样不开放）", async () => {
+  it("返回/音量±全型号开放自定义（2026-09-13：RC003 钩子投递、RC001 直接归因）", async () => {
     for (const model of ["rc003", "rc001", "unknown"] as const) {
       const wrapper = await mountPage(model);
       const backCell = wrapper
@@ -501,18 +501,47 @@ describe("buttons mapping page", () => {
         .findAll(".mapping-cell")[0]!;
       expect(
         (backCell.element as HTMLButtonElement).disabled,
-        `${model} 返回格子应禁用`,
-      ).toBe(true);
+        `${model} 返回格子应开放`,
+      ).toBe(false);
       const volumeCell = wrapper
         .findAll(".mapping-card")
         .find((c) => c.text().includes("音量"))!
         .findAll(".mapping-cell")[0]!;
       expect(
         (volumeCell.element as HTMLButtonElement).disabled,
-        `${model} 音量格子应禁用`,
-      ).toBe(true);
+        `${model} 音量格子应开放`,
+      ).toBe(false);
       await backCell.trigger("click");
-      expect(wrapper.find(".mapping-editor").exists()).toBe(false);
+      expect(wrapper.find(".mapping-editor").exists()).toBe(true);
     }
+  });
+
+  it("原生按键（透传）：有原生键的按键可配并即时保存，无原生键的不提供该选项", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "上", 0);
+    expect(chipState(wrapper, "原生按键（透传）")).toBe(false);
+
+    const nativeChip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((chip) => chip.text().includes("原生按键（透传）"));
+    await nativeChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) {
+        throw new Error("自动保存未触发");
+      }
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { single: { type: string } }>;
+    };
+    expect(saved.actions.up!.single.type).toBe("native");
+    expect(nativeChip!.classes()).toContain("selected");
+
+    // TV 没有原生键（native_key 返回 None）：编辑器不提供该 chip。
+    await openCell(wrapper, "TV", 0);
+    expect(
+      wrapper
+        .findAll(".mapping-editor .chip")
+        .some((chip) => chip.text().includes("原生按键（透传）")),
+    ).toBe(false);
   });
 });

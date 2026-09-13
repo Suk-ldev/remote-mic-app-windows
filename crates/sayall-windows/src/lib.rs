@@ -31,6 +31,8 @@ mod power;
 pub mod raw_input;
 #[cfg(windows)]
 mod raw_input_windows;
+#[cfg(windows)]
+mod rc003_hook;
 #[cfg(any(windows, test))]
 mod reconnect;
 pub mod send_input;
@@ -228,6 +230,10 @@ pub struct WindowsPlatform {
     raw_input: Arc<raw_input_windows::RawInputRuntime>,
     #[cfg(windows)]
     send_input: Arc<send_input_windows::SendInputRuntime>,
+    // 持有即运行：随平台生命周期托管 RC003 返回/音量± 注入器子进程（Drop 卸钩）。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    rc003_hook: Arc<rc003_hook::Rc003HookRuntime>,
 }
 
 impl fmt::Debug for WindowsPlatform {
@@ -293,6 +299,12 @@ impl Default for WindowsPlatform {
             key_suppressor::set_remote_hid_activity_notify(Box::new(move || {
                 wake_runtime.wake_reconnect();
             }));
+            // RC003 返回/音量± 钩子：连接就绪时注入 WUDFHost，边沿灌回同一映射引擎。
+            let hook_runtime = Arc::clone(&runtime);
+            let rc003_hook = Arc::new(rc003_hook::Rc003HookRuntime::start(
+                move || hook_runtime.snapshot(),
+                button_mapping.sender(),
+            ));
             Self {
                 usage,
                 voice_hold_hotkey,
@@ -304,6 +316,7 @@ impl Default for WindowsPlatform {
                 audio,
                 raw_input,
                 send_input,
+                rc003_hook,
             }
         }
 
