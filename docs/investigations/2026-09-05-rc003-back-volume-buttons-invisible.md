@@ -1,5 +1,7 @@
 # RC003 返回/音量± 三键在 Windows 上不可见（调查归档，2026-09-05）
 
+> **2026-09-13 更新：已解决。** 重启调查并在真机打通抓取路径——向 WUDFHost 注入 DLL 挂钩 `NtDeviceIoControlFile`(IOCTL `0x80018483`) 读 9 字节报文。见 [2026-09-13-rc003-wudfhost-tap-confirmed.md](2026-09-13-rc003-wudfhost-tap-confirmed.md)。本文保留为当时"搁置"状态的历史记录。
+
 ## 现象
 
 RC003 遥控器：确认/方向/电源/主页/菜单/TV 键全部正常（卡片高亮、锚点、
