@@ -1,0 +1,18 @@
+# 更新日志
+
+本文件记录「无线麦 SayAll」Windows 版的版本变更。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [0.2.9] - 2026-09-13
+
+### 修复
+- **RC003 返回/音量± 键终于生效**：承载遥控器 HID-over-GATT 的 WUDFHost 是写受限（write-restricted）LOCAL SERVICE 进程，钩子在装 Detours 时遍历宿主自身线程，其中个别线程 `OpenThread` 会被拒（`ACCESS_DENIED`），旧逻辑将其当致命错误、整体放弃装钩，导致返回/音量± 一直无效。现改为跳过开不了的线程、并始终修正当前线程，钩子可靠安装。
+- **钩子 DLL 自卸载，消除宿主内存泄漏**：旧实现每次连接都向 WUDFHost 注入一份永久驻留（PIN）的钩子 DLL，长期累积。现改为干净停止时排空在途回调后自卸载，宿主内不再累积；磁盘暂存副本同步清理。
+- **自启动任务注册失败修复**：安装包改为 perMachine（安装时自动请求管理员），此前 currentUser（非提权）安装导致注册管理员自启动计划任务失败（错误 `0x80004005`）。
+
+### 变更
+- **应用强制以管理员身份运行**：注入 WUDFHost 需要管理员权限，应用现内嵌 `requireAdministrator` 清单，启动即请求提权，无需再手动「以管理员身份运行」。
+
+### 诊断
+- 钩子安装失败时输出结构化诊断（`state` / `magic` / `hook_error` / 工作线程退出码 / 线程计数），便于一次日志定位。
+
+[0.2.9]: https://github.com/Suk-ldev/remote-mic-app-windows/releases/tag/v0.2.9
