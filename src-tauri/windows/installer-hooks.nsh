@@ -34,15 +34,10 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  # 以最高权限的登录任务承载自启动（管理员用户免 UAC；注入 WUDFHost 需要权限）。
-  # /f 覆盖旧任务（升级时刷新安装路径）；失败不阻断安装——应用仍可普通启动。
-  nsExec::ExecToLog 'schtasks /create /f /tn "${SAYALL_STARTUP_TASK}" /tr "$\"$INSTDIR\无线麦 SayAll.exe$\"" /sc onlogon /rl HIGHEST'
-  Pop $R8
-  ${If} $R8 != 0
-    ${IfNot} ${Silent}
-      MessageBox MB_ICONEXCLAMATION|MB_OK "自启动任务（管理员权限）注册失败（错误码 $R8）。返回/音量± 键钩子需要管理员权限才能生效；可稍后手动以管理员身份运行应用，或重新安装。$\r$\nThe admin autostart task could not be registered (error $R8). The back/volume hook needs admin rights; run the app as administrator later, or reinstall."
-    ${EndIf}
-  ${EndIf}
+  # 管理员登录自启动任务改由应用首次以管理员身份运行时自行注册：应用清单为
+  # requireAdministrator，每次启动即提权，可靠创建 HIGHEST 登录任务。此前在
+  # currentUser（非提权）安装器里直接 schtasks /create 会因权限不足失败
+  # （0x80004005 / -2147467259），故此处不再尝试，避免误导用户的失败提示。
   Push $R8
   ReadRegStr $R8 HKLM "${SAYALL_VB_CABLE_SERVICE_KEY}" "DisplayName"
   ${If} $R8 == ""

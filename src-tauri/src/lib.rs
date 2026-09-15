@@ -855,6 +855,47 @@ fn runtime_simulation_requested() -> bool {
         == Some(std::ffi::OsStr::new("1"))
 }
 
+/// 注册/刷新管理员登录自启动计划任务（`SayAllAdminStart`，onlogon + HIGHEST）。
+/// 应用已提权（requireAdministrator），故 `schtasks /create` 能成功；`/f` 覆盖
+/// 旧任务以刷新安装路径（升级/移动后自愈）。任务名与卸载器的删除项保持一致。
+/// 失败仅记录诊断、不影响应用运行——用户仍可手动启动（每次都会提权）。
+#[cfg(all(windows, not(feature = "runtime-simulation")))]
+fn ensure_admin_autostart_task() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const TASK_NAME: &str = "SayAllAdminStart";
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            sayall_windows::gatt_note(format!(
+                "admin_autostart action=register phase=completed terminal_result=failed error_domain=process error_code=current_exe_unavailable reason={error} retryable=false"
+            ));
+            return;
+        }
+    };
+    // /tr 值需自带引号，使存入任务的运行命令对含空格的安装路径正确加引号。
+    let task_run = format!("\"{}\"", exe.display());
+    match std::process::Command::new("schtasks")
+        .args([
+            "/create", "/f", "/tn", TASK_NAME, "/tr", task_run.as_str(), "/sc", "onlogon", "/rl",
+            "HIGHEST",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(output) if output.status.success() => sayall_windows::gatt_note(
+            "admin_autostart action=register phase=completed terminal_result=passed".to_owned(),
+        ),
+        Ok(output) => sayall_windows::gatt_note(format!(
+            "admin_autostart action=register phase=completed terminal_result=failed error_domain=schtasks error_code=exit_{} reason=create_failed retryable=true",
+            output.status.code().unwrap_or(-1)
+        )),
+        Err(error) => sayall_windows::gatt_note(format!(
+            "admin_autostart action=register phase=completed terminal_result=failed error_domain=process error_code=spawn_failed reason={error} retryable=true"
+        )),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_path = std::env::var_os("LOCALAPPDATA")
@@ -935,6 +976,14 @@ pub fn run() {
                 return;
             }
         }
+    }
+
+    // 管理员登录自启动任务由应用自行注册：应用清单为 requireAdministrator，每次
+    // 启动即提权，可靠创建/刷新 HIGHEST 登录任务；安装器是 currentUser（非提权），
+    // 无法在安装期创建（旧版即因此 0x80004005 失败）。后台线程执行，失败不阻断启动。
+    #[cfg(all(windows, not(feature = "runtime-simulation")))]
+    {
+        std::thread::spawn(ensure_admin_autostart_task);
     }
 
     let builder = tauri::Builder::default()
