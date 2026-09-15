@@ -23,10 +23,14 @@ if (-not (Test-Path -LiteralPath $vswhere)) { throw 'Existing MSVC Build Tools r
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (-not $vs) { throw 'Existing x64 MSVC compiler not found' }
 $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+# vcvarsall.bat invokes `vswhere` as a bareword; on non-standard VS install roots
+# (e.g. C:\BuildTools) the Installer dir is not on PATH, so make it discoverable.
+$installerDir = Split-Path -Parent $vswhere
 $native = Join-Path $root 'native\rc003-hook'
 $batch = Join-Path $out 'build.cmd'
 @"
 @echo off
+set "PATH=%PATH%;$installerDir"
 call "$vcvars" >nul
 if errorlevel 1 exit /b 1
 if not exist "$source\lib.X64\detours.lib" (

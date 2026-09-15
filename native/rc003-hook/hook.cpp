@@ -14,6 +14,10 @@ static HookShared* shared = nullptr;
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static unsigned g_prev_mask = 0;
 static volatile LONG started = 0;
+// Count threads currently executing inside HookIoctl. Teardown drains this to
+// zero before unloading the DLL, so no thread runs this module's code as it
+// leaves memory (the DLL is not pinned; it unloads itself on clean stop).
+static volatile LONG g_active = 0;
 
 // Single logical producer (serialized by g_lock): write the slot, publish head.
 static void PushEdge(LONG button, LONG pressed) {
@@ -45,6 +49,9 @@ static void ProcessReport(const unsigned char* buf, ULONG len) {
 static NTSTATUS NTAPI HookIoctl(HANDLE file, HANDLE event, PIO_APC_ROUTINE apc,
     PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID input, ULONG input_size,
     PVOID output, ULONG output_size) {
+    // Mark this module busy for the whole call so teardown can wait us out before
+    // unloading. Balanced by the decrement below on every return path.
+    InterlockedIncrement(&g_active);
     const NTSTATUS result = real_ioctl(file, event, apc, context, iosb, code,
         input, input_size, output, output_size);
     const DWORD saved = GetLastError();
@@ -54,6 +61,7 @@ static NTSTATUS NTAPI HookIoctl(HANDLE file, HANDLE event, PIO_APC_ROUTINE apc,
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     SetLastError(saved);
+    InterlockedDecrement(&g_active);
     return result;
 }
 
@@ -63,27 +71,43 @@ static LONG ChangeHook(bool install) {
     std::vector<HANDLE> threads;
     THREADENTRY32 entry{sizeof(entry)};
     LONG result = NO_ERROR;
+    LONG seen = 0, denied = 0;
     if (!Thread32First(snapshot, &entry)) result = static_cast<LONG>(GetLastError());
     else do {
         if (entry.th32OwnerProcessID != GetCurrentProcessId() ||
             entry.th32ThreadID == GetCurrentThreadId()) continue;
+        ++seen;
         HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
             THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
         if (!thread) {
-            const DWORD error = GetLastError();
-            if (error == ERROR_INVALID_PARAMETER) continue;
-            result = static_cast<LONG>(error);
-            break;
+            // WUDFHost is a write-restricted LOCAL SERVICE process: it cannot open
+            // all of its OWN peer threads for SUSPEND/SET_CONTEXT (ERROR_ACCESS_DENIED),
+            // and a thread can also exit mid-enumeration (ERROR_INVALID_PARAMETER).
+            // Neither is fatal -- previously ACCESS_DENIED aborted the whole hook and
+            // it never installed. Skip the thread; we still fix up the calling thread
+            // below (pseudo-handle, no OpenThread), and Detours rewrites ntdll's 5-byte
+            // stub as one transaction, so an un-updated peer only matters in the
+            // vanishingly rare case its RIP sits inside those 5 bytes at commit.
+            ++denied;
+            continue;
         }
         threads.push_back(thread);
     } while (Thread32Next(snapshot, &entry));
     CloseHandle(snapshot);
+    if (shared) {
+        shared->threads_seen = seen;
+        shared->threads_denied = denied;
+        shared->threads_updated = static_cast<LONG>(threads.size());
+    }
     if (result == NO_ERROR) {
         result = DetourTransactionBegin();
         if (result == NO_ERROR) {
             result = install
                 ? DetourAttach(reinterpret_cast<PVOID*>(&real_ioctl), HookIoctl)
                 : DetourDetach(reinterpret_cast<PVOID*>(&real_ioctl), HookIoctl);
+            // Always fix up the calling thread; GetCurrentThread() is a pseudo-handle
+            // that needs no OpenThread and is immune to the write-restricted token.
+            if (result == NO_ERROR) result = DetourUpdateThread(GetCurrentThread());
             for (HANDLE thread : threads) {
                 if (result != NO_ERROR) break;
                 DWORD exit_code = 0;
@@ -106,19 +130,23 @@ static DWORD RunHook() {
     wchar_t name[96];
     HookMappingName(name, GetCurrentProcessId());
     HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
-    if (!mapping) return GetLastError();
+    if (!mapping) { const DWORD e = GetLastError(); InterlockedExchange(&started, 0); return e; }
     shared = static_cast<HookShared*>(MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE,
         0, 0, sizeof(HookShared)));
     CloseHandle(mapping);
-    if (!shared) return GetLastError();
-    if (shared->magic != kHookMagic) return ERROR_INVALID_DATA;
+    if (!shared) { const DWORD e = GetLastError(); InterlockedExchange(&started, 0); return e; }
+    if (shared->magic != kHookMagic) { InterlockedExchange(&started, 0); return ERROR_INVALID_DATA; }
     InterlockedExchange(&shared->state, HS_Starting);
-    // Pin: detaching a hook is not proof every thread has left the callback.
-    HMODULE pinned = nullptr;
+    // Grab our own module handle WITHOUT bumping the refcount: LoadRemote's
+    // LoadLibraryW holds the single reference, and on clean teardown we release
+    // exactly that one via FreeLibraryAndExitThread so the DLL unloads instead of
+    // accumulating a pinned copy per connect in the long-lived device-pool host.
+    HMODULE self = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_PIN,
-            reinterpret_cast<LPCWSTR>(&SayAllHookStart), &pinned)) {
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&SayAllHookStart), &self)) {
         shared->error = static_cast<LONG>(GetLastError());
+        InterlockedExchange(&started, 0);
         InterlockedExchange(&shared->state, HS_Failed);
         return static_cast<DWORD>(shared->error);
     }
@@ -127,12 +155,13 @@ static DWORD RunHook() {
     LONG result = real_ioctl ? ChangeHook(true) : ERROR_PROC_NOT_FOUND;
     if (result != NO_ERROR) {
         shared->error = result;
+        InterlockedExchange(&started, 0);
         InterlockedExchange(&shared->state, HS_Failed);
         return static_cast<DWORD>(result);
     }
     InterlockedExchange(&shared->state, HS_Capturing);
     // App-controlled lifetime: run until it requests teardown (method 3 unhooks
-    // on remote sleep/disconnect). No fixed timer; the host is pinned regardless.
+    // on remote sleep/disconnect). No fixed timer.
     while (!InterlockedCompareExchange(&shared->stop, 0, 0)) Sleep(25);
     InterlockedExchange(&shared->state, HS_Stopping);
     result = ChangeHook(false);
@@ -144,8 +173,25 @@ static DWORD RunHook() {
     g_prev_mask = 0;
     ReleaseSRWLockExclusive(&g_lock);
     shared->error = result;
+    // Detach is done; drain any thread still inside HookIoctl before we free the
+    // module, so none is executing our code as it unloads. Bounded wait -- if a
+    // straggler never clears (should not happen; the callback is short), fall back
+    // to staying resident: a rare leaked copy is better than freeing live code.
+    bool drained = false;
+    for (int i = 0; i < 400; ++i) {  // ~2s
+        if (InterlockedCompareExchange(&g_active, 0, 0) == 0) { drained = true; break; }
+        Sleep(5);
+    }
+    InterlockedExchange(&started, 0);
     InterlockedExchange(&shared->state, result == NO_ERROR ? HS_Stopped : HS_Failed);
-    started = 0;  // allow a later re-arm into the same pinned DLL (method 3 wake)
+    if (drained && self) {
+        Sleep(50);  // margin for the uncounted prologue/epilogue of any last caller
+        UnmapViewOfFile(shared);
+        shared = nullptr;
+        // Releases LoadRemote's reference and exits this thread atomically; the DLL
+        // unloads once the refcount hits zero. Never returns.
+        FreeLibraryAndExitThread(self, static_cast<DWORD>(result));
+    }
     return static_cast<DWORD>(result);
 }
 

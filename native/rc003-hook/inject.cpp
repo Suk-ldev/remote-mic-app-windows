@@ -231,8 +231,13 @@ int wmain() {
         shared->stop = 0;
         shared->state = HS_Idle;
 
+        // Stage a fresh, uniquely-named hook DLL and inject it. The DLL unloads
+        // itself on teardown (no pin), so it does not accumulate in the long-lived
+        // shared device-pool host; the unique name still avoids colliding on disk
+        // with a prior copy whose unload timed out and stayed resident.
         const std::wstring staged = StageDll(SourceDll());
         const std::wstring staged_base = Basename(staged);
+        const std::wstring staged_dir = staged.substr(0, staged.find_last_of(L"\\/"));
         LoadRemote(process.value, pid, staged, staged_base);
         // Resolve the hook's entry point in the remote and start its worker.
         HMODULE local = LoadLibraryExW(SourceDll().c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -246,7 +251,32 @@ int wmain() {
         const ULONGLONG begun = GetTickCount64();
         while (shared->state != HS_Capturing && shared->state != HS_Failed &&
             WaitForSingleObject(worker.value, 0) == WAIT_TIMEOUT && GetTickCount64() - begun < 10000) Sleep(20);
-        Assert(shared->state == HS_Capturing, "hook_installed");
+        if (shared->state != HS_Capturing) {
+            // Localize the failing leg. state/magic separate a handshake failure
+            // (worker never mapped our section: state stays 0/Idle, magic still
+            // reads back ours) from a Detours failure (state=HS_Failed with
+            // hook_error set). worker_exit is RunHook's return value -- the real
+            // error code of the silent early-return paths (OpenFileMapping /
+            // MapViewOfFile / magic / pin) that never touch shared. A live worker
+            // reads back STILL_ACTIVE (259); report that as "running" so a genuine
+            // 259 error can't masquerade as a 10s timeout.
+            DWORD exit_code = 0;
+            const bool got = GetExitCodeThread(worker.value, &exit_code) != FALSE;
+            const bool running = got && exit_code == STILL_ACTIVE;
+            std::fprintf(stderr,
+                "stage=hook_installed result=failed win32=%lu state=%ld magic=0x%08lX hook_error=%ld worker=%s worker_exit=%lu threads_seen=%ld threads_updated=%ld threads_denied=%ld\n",
+                running ? 0u : exit_code,
+                static_cast<long>(shared->state), static_cast<unsigned long>(shared->magic),
+                static_cast<long>(shared->error), running ? "running" : "exited", exit_code,
+                static_cast<long>(shared->threads_seen), static_cast<long>(shared->threads_updated),
+                static_cast<long>(shared->threads_denied));
+            std::fflush(stderr);
+            throw std::runtime_error("hook_installed");
+        }
+        std::fprintf(stderr, "stage=hook_installed result=passed threads_seen=%ld threads_updated=%ld threads_denied=%ld\n",
+            static_cast<long>(shared->threads_seen), static_cast<long>(shared->threads_updated),
+            static_cast<long>(shared->threads_denied));
+        std::fflush(stderr);
         std::printf("ready\n");
 
         // Stream edges until the parent closes stdin (EOF -> request unhook) or
@@ -274,8 +304,16 @@ int wmain() {
             Sleep(8);
         }
         InterlockedExchange(&shared->stop, 1);
-        WaitForSingleObject(worker.value, 5000);
-        Emit("stream", "stopped", 0);
+        // On a clean stop the worker unloads the hook DLL before its thread exits,
+        // so once the thread is gone the staged copy on disk is no longer mapped
+        // and can be removed. If the worker didn't exit in time (a wedged drain
+        // left it resident), leave the file in place -- it may still be mapped.
+        const bool worker_gone = WaitForSingleObject(worker.value, 6000) == WAIT_OBJECT_0;
+        if (worker_gone) {
+            DeleteFileW(staged.c_str());
+            RemoveDirectoryW(staged_dir.c_str());
+        }
+        Emit("stream", worker_gone ? "stopped" : "worker_wedged", 0);
         return 0;
     } catch (const std::exception&) {
         return 1;

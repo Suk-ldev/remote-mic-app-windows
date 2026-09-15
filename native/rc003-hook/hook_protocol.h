@@ -29,6 +29,9 @@ struct HookShared {
     volatile LONG error;      // Win32/Detours error on failure
     volatile LONG edge_head;  // total edges produced; app drains [tail, edge_head)
     volatile LONG reports;    // carrier reports observed (diagnostic)
+    volatile LONG threads_seen;     // host peer threads enumerated at hook time (diag)
+    volatile LONG threads_updated;  // peer threads DetourUpdateThread could fix up (diag)
+    volatile LONG threads_denied;   // peer threads OpenThread refused -- write-restricted host (diag)
     HookEdge edges[kEdgeRing];
 };
 
