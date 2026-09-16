@@ -400,29 +400,29 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Ok,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Control, KeyCode::Enter],
                     },
-                },
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Shortcut {
+                }],
+                double: Vec::new(),
+                long: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Escape],
                     },
-                },
+                }],
             },
         );
         let encoded = serde_json::to_string(&mappings).unwrap();
         let decoded: ButtonMappings = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, mappings);
         assert_eq!(
-            decoded.action_for(RemoteButton::Ok, ButtonTrigger::Single),
-            ButtonAction::Shortcut {
+            decoded.sequence_for(RemoteButton::Ok, ButtonTrigger::Single),
+            vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::Control, KeyCode::Enter],
                 }
-            }
+            }]
         );
     }
 
@@ -444,13 +444,13 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Power,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Escape],
                     },
-                },
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Disabled,
+                }],
+                double: Vec::new(),
+                long: Vec::new(),
             },
         );
 

@@ -496,7 +496,7 @@ async fn test_button_mapping(
     tauri::async_runtime::spawn_blocking(move || -> Result<SendInputSnapshot, String> {
         let mut last = SendInputSnapshot::default();
         for action in sequence {
-            last = run_mapping_action(&platform, button, action)?;
+            last = run_mapping_action(platform.as_ref(), button, action)?;
         }
         Ok(last)
     })

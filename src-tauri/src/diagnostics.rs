@@ -197,6 +197,7 @@ mod tests {
                 last_button: Some(RemoteButton::Ok),
                 last_is_pressed: Some(false),
                 active_buttons: Vec::new(),
+                profile_id: None,
                 last_error: Some("\\\\?\\HID#private-device-path".to_owned()),
             },
             button_mapping: sayall_windows::button_mapping::ButtonMappingSnapshot {
