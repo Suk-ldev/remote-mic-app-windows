@@ -1,5 +1,8 @@
 use sayall_windows::raw_input::RawInputSnapshot;
-use sayall_windows::send_input::{KeyChord, SendInputSnapshot, VoiceHotkeySettings};
+use sayall_windows::app_profiles::AppProfileBindings;
+use sayall_windows::send_input::{
+    KeyChord, MouseAction, SendInputSnapshot, VoiceHotkeySettings,
+};
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
     PlatformSnapshot, UsageCounters, WindowsPlatform,
@@ -30,14 +33,23 @@ pub trait PlatformRuntime: Debug + Send + Sync {
     fn stop_raw_input(&self) -> Result<RawInputSnapshot, PlatformError>;
     fn send_input_snapshot(&self) -> SendInputSnapshot;
     fn test_shortcut(&self, chord: KeyChord) -> Result<SendInputSnapshot, PlatformError>;
+    fn test_mouse(&self, kind: MouseAction) -> Result<SendInputSnapshot, PlatformError>;
+    fn test_text(&self, value: &str) -> Result<SendInputSnapshot, PlatformError>;
     /// 预设应用清单（含安装状态）。
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo>;
     /// 打开/激活预设应用（测试按钮与引擎共用路径）。
     fn launch_app(&self, target: &str) -> Result<(), PlatformError>;
     fn voice_hold_hotkey(&self) -> VoiceHotkeySettings;
     fn set_voice_hold_hotkey(&self, hotkey: VoiceHotkeySettings);
+    fn injection_hold(&self) -> std::time::Duration;
+    fn set_injection_hold(&self, hold: std::time::Duration);
+    fn voice_dsp(&self) -> sayall_core::VoiceDspSettings;
+    fn set_voice_dsp(&self, settings: sayall_core::VoiceDspSettings);
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings;
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings);
+    fn app_profiles(&self) -> AppProfileBindings;
+    fn set_app_profiles(&self, bindings: AppProfileBindings);
+    fn active_app_profile(&self) -> Option<String>;
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot;
     fn subscribe_button_edges(&self, callback: sayall_windows::button_mapping::ButtonEdgeCallback);
     fn subscribe_button_gestures(
@@ -122,6 +134,14 @@ impl PlatformRuntime for WindowsPlatform {
         self.test_shortcut(chord)
     }
 
+    fn test_mouse(&self, kind: MouseAction) -> Result<SendInputSnapshot, PlatformError> {
+        self.test_mouse(kind)
+    }
+
+    fn test_text(&self, value: &str) -> Result<SendInputSnapshot, PlatformError> {
+        self.test_text(value)
+    }
+
     fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
         sayall_windows::app_launcher::probe_preset_apps()
     }
@@ -139,12 +159,40 @@ impl PlatformRuntime for WindowsPlatform {
         WindowsPlatform::set_voice_hold_hotkey(self, hotkey)
     }
 
+    fn injection_hold(&self) -> std::time::Duration {
+        WindowsPlatform::injection_hold(self)
+    }
+
+    fn set_injection_hold(&self, hold: std::time::Duration) {
+        WindowsPlatform::set_injection_hold(self, hold)
+    }
+
+    fn voice_dsp(&self) -> sayall_core::VoiceDspSettings {
+        WindowsPlatform::voice_dsp(self)
+    }
+
+    fn set_voice_dsp(&self, settings: sayall_core::VoiceDspSettings) {
+        WindowsPlatform::set_voice_dsp(self, settings)
+    }
+
     fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings {
         WindowsPlatform::button_mappings(self)
     }
 
     fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings) {
         WindowsPlatform::set_button_mappings(self, mappings)
+    }
+
+    fn app_profiles(&self) -> AppProfileBindings {
+        WindowsPlatform::app_profiles(self)
+    }
+
+    fn set_app_profiles(&self, bindings: AppProfileBindings) {
+        WindowsPlatform::set_app_profiles(self, bindings)
+    }
+
+    fn active_app_profile(&self) -> Option<String> {
+        WindowsPlatform::active_app_profile(self)
     }
 
     fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {
@@ -168,7 +216,9 @@ mod simulation {
     use super::*;
     use sayall_core::{AtvvCapabilities, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
     use sayall_windows::raw_input::{RawInputPhase, RemoteButton};
-    use sayall_windows::send_input::{plan_key_tap, KeyChord, VoiceHotkeySettings};
+    use sayall_windows::send_input::{
+        plan_key_tap, KeyChord, VoiceHotkeySettings, DEFAULT_INJECTION_HOLD,
+    };
     use sayall_windows::{AudioPhase, ConnectionPhase, RemoteModel};
     use std::sync::{Mutex, MutexGuard};
 
@@ -199,12 +249,31 @@ mod simulation {
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     pub struct SimulatedPlatform {
         usage: Arc<UsageCounters>,
         state: Mutex<SimulationState>,
         voice_hold_hotkey: Mutex<VoiceHotkeySettings>,
+        injection_hold: Mutex<std::time::Duration>,
+        voice_dsp: Mutex<sayall_core::VoiceDspSettings>,
         button_mappings: Mutex<sayall_windows::send_input::ButtonMappings>,
+        app_profiles: Mutex<AppProfileBindings>,
+        active_app_profile: Mutex<Option<String>>,
+    }
+
+    impl Default for SimulatedPlatform {
+        fn default() -> Self {
+            Self {
+                usage: Arc::new(UsageCounters::default()),
+                state: Mutex::new(SimulationState::default()),
+                voice_hold_hotkey: Mutex::new(VoiceHotkeySettings::default()),
+                injection_hold: Mutex::new(DEFAULT_INJECTION_HOLD),
+                voice_dsp: Mutex::new(sayall_core::VoiceDspSettings::default()),
+                button_mappings: Mutex::new(sayall_windows::send_input::ButtonMappings::default()),
+                app_profiles: Mutex::new(AppProfileBindings::default()),
+                active_app_profile: Mutex::new(None),
+            }
+        }
     }
 
     impl SimulatedPlatform {
@@ -403,6 +472,27 @@ mod simulation {
             Ok(state.send_input.clone())
         }
 
+        fn test_mouse(&self, _kind: MouseAction) -> Result<SendInputSnapshot, PlatformError> {
+            let mut state = lock(&self.state);
+            state.send_input.submitted_batches =
+                state.send_input.submitted_batches.saturating_add(1);
+            state.send_input.submitted_events = state.send_input.submitted_events.saturating_add(1);
+            state.send_input.last_error = None;
+            Ok(state.send_input.clone())
+        }
+
+        fn test_text(&self, value: &str) -> Result<SendInputSnapshot, PlatformError> {
+            let mut state = lock(&self.state);
+            state.send_input.submitted_batches =
+                state.send_input.submitted_batches.saturating_add(1);
+            state.send_input.submitted_events = state
+                .send_input
+                .submitted_events
+                .saturating_add(value.chars().count() as u64);
+            state.send_input.last_error = None;
+            Ok(state.send_input.clone())
+        }
+
         fn preset_apps(&self) -> Vec<sayall_windows::app_launcher::PresetAppInfo> {
             // CI 仿真环境：预设表全部标记为可用，验证 UI 渲染路径。
             sayall_windows::app_launcher::PRESET_APPS
@@ -428,12 +518,41 @@ mod simulation {
             *lock(&self.voice_hold_hotkey) = hotkey;
         }
 
+        fn injection_hold(&self) -> std::time::Duration {
+            *lock(&self.injection_hold)
+        }
+
+        fn set_injection_hold(&self, hold: std::time::Duration) {
+            *lock(&self.injection_hold) = hold;
+        }
+
+        fn voice_dsp(&self) -> sayall_core::VoiceDspSettings {
+            *lock(&self.voice_dsp)
+        }
+
+        fn set_voice_dsp(&self, settings: sayall_core::VoiceDspSettings) {
+            *lock(&self.voice_dsp) = settings.normalized();
+        }
+
         fn button_mappings(&self) -> sayall_windows::send_input::ButtonMappings {
             lock(&self.button_mappings).clone()
         }
 
         fn set_button_mappings(&self, mappings: sayall_windows::send_input::ButtonMappings) {
             *lock(&self.button_mappings) = mappings;
+        }
+
+        fn app_profiles(&self) -> AppProfileBindings {
+            lock(&self.app_profiles).clone()
+        }
+
+        fn set_app_profiles(&self, bindings: AppProfileBindings) {
+            *lock(&self.app_profiles) = bindings.normalized();
+            *lock(&self.active_app_profile) = None;
+        }
+
+        fn active_app_profile(&self) -> Option<String> {
+            lock(&self.active_app_profile).clone()
         }
 
         fn button_mapping_snapshot(&self) -> sayall_windows::button_mapping::ButtonMappingSnapshot {

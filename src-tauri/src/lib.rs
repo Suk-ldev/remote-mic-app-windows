@@ -1,5 +1,4 @@
 use sayall_windows::app_profiles::AppProfileBindings;
-use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::send_input::{
     ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, SendInputSnapshot, VoiceHotkeySettings,
@@ -10,7 +9,7 @@ use sayall_windows::{
 };
 use serde::{Deserialize, Serialize};
 use settings::SettingsStore;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 mod diagnostics;
@@ -454,12 +453,21 @@ fn button_mapping_log_summary(mappings: &ButtonMappings) -> String {
     let mut native_count = 0_usize;
     let mut disabled_count = 0_usize;
     for actions in mappings.actions.values() {
-        for action in [&actions.single, &actions.double, &actions.long] {
+        for action in actions
+            .single
+            .iter()
+            .chain(actions.double.iter())
+            .chain(actions.long.iter())
+        {
             match action {
                 ButtonAction::Shortcut { .. } => shortcut_count += 1,
                 ButtonAction::OpenApp { .. } => open_app_count += 1,
                 ButtonAction::Native => native_count += 1,
                 ButtonAction::Disabled => disabled_count += 1,
+                ButtonAction::HoldShortcut { .. }
+                | ButtonAction::Mouse { .. }
+                | ButtonAction::Text { .. }
+                | ButtonAction::Delay { .. } => {}
             }
         }
     }
@@ -498,7 +506,7 @@ async fn test_button_mapping(
 
 /// 执行一步映射动作（按键映射测试用；真实触发走 button_mapping 引擎）。
 fn run_mapping_action(
-    platform: &sayall_windows::WindowsPlatform,
+    platform: &dyn PlatformRuntime,
     button: RemoteButton,
     action: ButtonAction,
 ) -> Result<SendInputSnapshot, String> {
