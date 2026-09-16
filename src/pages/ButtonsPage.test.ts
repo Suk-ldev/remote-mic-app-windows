@@ -190,7 +190,7 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
-  it("renders the remote canvas with 12 button cards, the voice card and 36 trigger cells", async () => {
+  it("renders 12 canvas buttons, the voice card and 39 trigger cells including mute", async () => {
     const wrapper = await mountPage();
     expect(wrapper.findAll(".mapping-card")).toHaveLength(13);
     // 画布 12 键 × 3 + 画布外的静音键 × 3：静音键可解码却没有示意图位置，

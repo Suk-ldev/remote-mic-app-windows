@@ -127,10 +127,10 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     "按键画布没有渲染语音键卡片",
   );
   assert(
-    Array.from(document.querySelectorAll(".mapping-cell")).length === 36,
-    "按键画布没有渲染 12 键 × 3 触发方式的单元格",
+    Array.from(document.querySelectorAll(".mapping-cell")).length === 39,
+    "按键页没有渲染画布 12 键与画布外静音键的 39 个触发单元格",
   );
-  steps.push("按键映射画布渲染 12 张按键卡与三列触发单元格");
+  steps.push("按键页渲染画布 12 键、画布外静音键与三列触发单元格");
 
   await saveButtonMappings({
     enabled: true,
