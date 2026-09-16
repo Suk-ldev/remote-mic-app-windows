@@ -5,8 +5,8 @@ name: Windows Release
 # 2. 用仓库 Secret TAURI_SIGNING_PRIVATE_KEY 构建 minisign 签名的 NSIS 安装器
 #    （缺 Secret 直接失败——禁止用一次性密钥发布正式更新包）；
 # 3. 生成 latest.json（updater 静态清单）并把资产重命名为纯 ASCII 文件名；
-# 4. 创建 DRAFT Release 并挂载资产——人工核对后点 Publish 才对全量用户生效
-#    （releases/latest/download/latest.json 只统计已发布的稳定 Release）。
+# 4. release/v0.2.10 分支已由完整 Windows CI 验收，本分支直接创建稳定 Release；
+#    main 上后续版本仍保持先创建 Draft、人工核对后发布的默认流程。
 on:
   workflow_dispatch:
   push:
@@ -80,11 +80,11 @@ jobs:
       - name: Show staged assets before release (delete-free verification)
         shell: pwsh
         run: |
-          Write-Host "将上传到 Draft Release $env:GITHUB_REF_NAME 的资产清单："
+          Write-Host "将上传到稳定 Release $env:GITHUB_REF_NAME 的资产清单："
           Get-ChildItem -LiteralPath "artifacts/windows-release" -File |
             ForEach-Object { Write-Host ("- {0} ({1} bytes)" -f $_.Name, $_.Length) }
 
-      - name: Create draft GitHub release with assets
+      - name: Create stable GitHub release with assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,15 +92,37 @@ jobs:
           $tag = $env:SAYALL_RELEASE_TAG
           $assets = Get-ChildItem -LiteralPath "artifacts/windows-release" -File | ForEach-Object { $_.FullName }
           $notes = @"
-          无线麦 SayAll Windows 版 $tag
+          ## 无线麦 SayAll Windows $tag
 
-          - 应用内更新通道资产：latest.json + SayAll-Windows-x64-setup.exe(.sig)（minisign 签名，应用内检查更新自动验签安装）
-          - 校验和见 SHA256SUMS.txt
-          - Authenticode 代码签名仍待建立（首次运行可能触发 SmartScreen 提示）
-          - 人工核对后 Publish 本草稿：Publish 即对全量用户开启本版本更新（releases/latest 指向最新已发布稳定版）
+          ### 修复
+          - 双击判定改为跟随 Windows 双击速度，并限制在 0.5-0.9 秒，减少蓝牙遥控器自然双击被识别成两次单击。
+          - 映射按键新增可调保持时间，默认 30 毫秒，解决游戏及部分 Electron 应用漏收按键的问题。
+
+          ### 新增
+          - 每个触发格支持最多 8 步动作序列，可插入等待。
+          - 支持读取搜狗、豆包输入法的语音热键。
+          - 支持按前台应用自动切换映射方案。
+          - 准备页显示遥控器电量和未就绪错误码。
+          - 新增鼠标键、滚轮、文本输出、按住快捷键等动作。
+          - 新增通用、阅读、影音三套预设方案。
+          - 语音工具预设扩展到微信输入法、Windows 语音输入、千问、搜狗、豆包和关闭。
+          - 新增默认关闭的语音增强：高通滤波、自动增益、软限幅。
+          - 新增首启准备页和应用内运行日志。
+          - 新增 Google TV / Chromecast 遥控器机型档案，目前尚未真机验收。
+          - 静音键现可在“该遥控器的其他按键”中配置。
+          - 新增语音期间临时切换默认麦克风，默认关闭。该功能依赖未公开的 IPolicyConfig，验证前请勿开启。
+
+          ### 变更
+          - 未知动作类型降级为“未配置”，不再导致整份映射读取失败。
+          - 设置 schema 升级到 4，旧配置缺失字段时自动使用默认值。
+
+          ### 下载与校验
+          - 应用内更新使用 latest.json 和 minisign 签名校验。
+          - 文件校验和见 SHA256SUMS.txt。
+          - Authenticode 代码签名仍待建立，首次运行可能触发 SmartScreen 提示。
           "@
-          gh release create $tag --target $env:GITHUB_SHA --draft --title "无线麦 SayAll Windows $tag" --notes $notes @assets
+          gh release create $tag --target $env:GITHUB_SHA --latest --title "无线麦 SayAll Windows $tag" --notes $notes @assets
           if ($LASTEXITCODE -ne 0) {
-            throw "gh release create 失败（exit $LASTEXITCODE；若 Release 已存在请人工核对后处理，本流程不做任何删除/覆盖）"
+            throw "gh release create 失败（exit $LASTEXITCODE；本流程不做任何删除/覆盖）"
           }
-          Write-Host "Draft Release $tag 已创建并挂载资产，等待人工核对与 Publish"
+          Write-Host "Stable Release $tag 已创建、发布并挂载资产"
