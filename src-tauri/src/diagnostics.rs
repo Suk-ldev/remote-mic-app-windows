@@ -58,6 +58,8 @@ pub struct AudioDiagnostic {
 #[serde(rename_all = "camelCase")]
 pub struct RawInputDiagnostic {
     pub phase: RawInputPhase,
+    /// 已识别的遥控器机型档案 id：报障时据此判断用的是哪种遥控器。
+    pub profile_id: Option<String>,
     pub matched_device_count: u32,
     pub raw_event_count: u64,
     pub semantic_edge_count: u64,
@@ -129,6 +131,7 @@ impl DiagnosticReport {
             },
             raw_input: RawInputDiagnostic {
                 phase: platform.raw_input.phase,
+                profile_id: platform.raw_input.profile_id.clone(),
                 matched_device_count: platform.raw_input.matched_device_count,
                 raw_event_count: platform.raw_input.raw_event_count,
                 semantic_edge_count: platform.raw_input.semantic_edge_count,

@@ -153,6 +153,7 @@ describe("diagnostic report presentation", () => {
       },
       rawInput: {
         phase: "stopped",
+        profileId: null,
         matchedDeviceCount: 0,
         rawEventCount: 0,
         semanticEdgeCount: 0,

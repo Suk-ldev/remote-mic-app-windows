@@ -68,6 +68,7 @@ const runtime: RuntimeSnapshot = {
       phase: "idle",
       remoteName: null,
       remoteModel: "unknown",
+      batteryLevel: null,
       capabilities: null,
       voiceState: "idle",
       decodedSamples: 0,
@@ -87,6 +88,7 @@ const runtime: RuntimeSnapshot = {
     },
     rawInput: {
       phase: "unsupported",
+      profileId: null,
       matchedDeviceCount: 0,
       rawEventCount: 0,
       semanticEdgeCount: 0,

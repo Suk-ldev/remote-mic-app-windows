@@ -109,6 +109,17 @@ pub enum KeyCode {
     F10,
     F11,
     F12,
+    Minus,
+    Equal,
+    BracketLeft,
+    BracketRight,
+    Backslash,
+    Semicolon,
+    Quote,
+    Backtick,
+    Comma,
+    Period,
+    Slash,
 }
 
 impl KeyCode {
@@ -195,6 +206,17 @@ impl KeyCode {
             Self::MediaPrev => 0xB1,
             Self::MediaNext => 0xB0,
             Self::MediaPlayPause => 0xB3,
+            Self::Semicolon => 0xBA,
+            Self::Equal => 0xBB,
+            Self::Comma => 0xBC,
+            Self::Minus => 0xBD,
+            Self::Period => 0xBE,
+            Self::Slash => 0xBF,
+            Self::Backtick => 0xC0,
+            Self::BracketLeft => 0xDB,
+            Self::Backslash => 0xDC,
+            Self::BracketRight => 0xDD,
+            Self::Quote => 0xDE,
         }
     }
 
@@ -240,6 +262,156 @@ impl KeyCode {
     }
 }
 
+/// 按键映射注入的默认保持时长：DOWN 与 UP 之间的间隔。
+///
+/// 为什么不是零：零间隔的 DOWN+UP 单批提交对**轮询键盘状态**的程序（游戏、
+/// 部分 Electron / Qt 应用）可能整个丢掉——它们在两次轮询之间根本没看见按键
+/// 按下过。参考项目 axonkey 的 Windows 文档给出同一结论并采用 50ms；这里取
+/// 30ms 折中（连发上限约 16 次/秒，仍高于方向键的 100ms 连发间隔），漏识别时
+/// 用户可在设置里调高。
+pub const DEFAULT_INJECTION_HOLD: Duration = Duration::from_millis(30);
+/// 保持时长上限：再长会让连发慢到不可用。
+pub const MAX_INJECTION_HOLD: Duration = Duration::from_millis(1000);
+
+/// 滚轮连滚间隔（约 14 次/秒）与起始延迟由 [`crate::button_gestures`] 的
+/// REPEAT_START_DELAY 决定：轻点滚一格，按住持续滚。
+pub const WHEEL_REPEAT_INTERVAL: Duration = Duration::from_millis(70);
+
+/// 一次滚轮动作滚过的格数（WHEEL_DELTA 的倍数由后端换算）。
+pub const WHEEL_NOTCHES: i32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseAction {
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+    LeftClick,
+    RightClick,
+    MiddleClick,
+}
+
+impl MouseAction {
+    pub fn is_wheel(self) -> bool {
+        matches!(
+            self,
+            Self::WheelUp | Self::WheelDown | Self::WheelLeft | Self::WheelRight
+        )
+    }
+}
+
+/// 文本动作的字符数上限：注入按字符展开成 SendInput 事件，过长会长时间
+/// 占住前台输入队列。
+pub const MAX_TEXT_CHARS: usize = 256;
+
+/// 全部键码，顺序与枚举定义一致。用于 VK 反查（读取输入法配置时需要把
+/// Windows 虚拟键码还原成本项目的键码）。
+pub const ALL_KEY_CODES: [KeyCode; 92] = [
+    KeyCode::Control,
+    KeyCode::LeftControl,
+    KeyCode::RightControl,
+    KeyCode::Shift,
+    KeyCode::LeftShift,
+    KeyCode::RightShift,
+    KeyCode::Alt,
+    KeyCode::LeftAlt,
+    KeyCode::RightAlt,
+    KeyCode::LeftWindows,
+    KeyCode::RightWindows,
+    KeyCode::Backspace,
+    KeyCode::Tab,
+    KeyCode::Enter,
+    KeyCode::Escape,
+    KeyCode::Space,
+    KeyCode::PageUp,
+    KeyCode::PageDown,
+    KeyCode::End,
+    KeyCode::Home,
+    KeyCode::Left,
+    KeyCode::Up,
+    KeyCode::Right,
+    KeyCode::Down,
+    KeyCode::Insert,
+    KeyCode::Delete,
+    KeyCode::Apps,
+    KeyCode::VolumeMute,
+    KeyCode::VolumeDown,
+    KeyCode::VolumeUp,
+    KeyCode::MediaPrev,
+    KeyCode::MediaNext,
+    KeyCode::MediaPlayPause,
+    KeyCode::A,
+    KeyCode::B,
+    KeyCode::C,
+    KeyCode::D,
+    KeyCode::E,
+    KeyCode::F,
+    KeyCode::G,
+    KeyCode::H,
+    KeyCode::I,
+    KeyCode::J,
+    KeyCode::K,
+    KeyCode::L,
+    KeyCode::M,
+    KeyCode::N,
+    KeyCode::O,
+    KeyCode::P,
+    KeyCode::Q,
+    KeyCode::R,
+    KeyCode::S,
+    KeyCode::T,
+    KeyCode::U,
+    KeyCode::V,
+    KeyCode::W,
+    KeyCode::X,
+    KeyCode::Y,
+    KeyCode::Z,
+    KeyCode::Digit0,
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+    KeyCode::F1,
+    KeyCode::F2,
+    KeyCode::F3,
+    KeyCode::F4,
+    KeyCode::F5,
+    KeyCode::F6,
+    KeyCode::F7,
+    KeyCode::F8,
+    KeyCode::F9,
+    KeyCode::F10,
+    KeyCode::F11,
+    KeyCode::F12,
+    KeyCode::Minus,
+    KeyCode::Equal,
+    KeyCode::BracketLeft,
+    KeyCode::BracketRight,
+    KeyCode::Backslash,
+    KeyCode::Semicolon,
+    KeyCode::Quote,
+    KeyCode::Backtick,
+    KeyCode::Comma,
+    KeyCode::Period,
+    KeyCode::Slash,
+];
+
+impl KeyCode {
+    /// Windows 虚拟键码反查。同一 VK 可能对应多个变体（如 Control 与
+    /// LeftControl 共用 0x11 之外的族），返回表中第一个匹配项。
+    pub fn from_virtual_key(virtual_key: u16) -> Option<Self> {
+        ALL_KEY_CODES
+            .into_iter()
+            .find(|key| key.virtual_key() == virtual_key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyChord {
@@ -249,8 +421,6 @@ pub struct KeyChord {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ButtonAction {
-    #[default]
-    Disabled,
     Shortcut {
         chord: KeyChord,
     },
@@ -263,6 +433,29 @@ pub enum ButtonAction {
     /// 可配置组合。对无原生键的按键（返回/电源/TV，[`native_key`] 返回
     /// None）无意义，持久化归一化时降级为 [`ButtonAction::Disabled`]。
     Native,
+    /// 鼠标动作：滚轮或按键。滚轮挂在单击列且未配双击/长按时按住连滚。
+    Mouse {
+        kind: MouseAction,
+    },
+    /// 按住快捷键：按下注入 DOWN、松开注入 UP，遥控器按多久就按住多久。
+    /// 只在单击列有意义，归一化时与双击/长按共存则降级为 [`ButtonAction::Shortcut`]。
+    HoldShortcut {
+        chord: KeyChord,
+    },
+    /// 文本输出：按 Unicode 逐字符注入。
+    Text {
+        value: String,
+    },
+    /// 序列中的等待步骤（毫秒）。目标应用需要时间处理上一步时插在中间，
+    /// 例如"粘贴文本 → 等 30ms → 回车"。
+    Delay {
+        ms: u32,
+    },
+    /// 未配置。同时是未知 `type` 的兜底：新版本写入的动作被旧版本读到时
+    /// 降级为未配置，而不是整份映射文件反序列化失败。
+    #[default]
+    #[serde(other)]
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -273,26 +466,36 @@ pub enum ButtonTrigger {
     Long,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 一个触发格里的动作序列上限。
+///
+/// 8 步之内的序列还能一眼读懂和复核；更长的链应该做成预设方案，而不是挂在
+/// 一次按键上（同一取舍见参考项目 vibe-flow 的手势宏上限）。
+pub const MAX_SEQUENCE_STEPS: usize = 8;
+/// 单个等待步骤的上限。
+pub const MAX_DELAY: Duration = Duration::from_millis(2_000);
+/// 一个序列里全部等待步骤的总和上限：序列在引擎线程上顺序执行，等待期间
+/// 不处理新的按键边沿，所以总等待必须有界。
+pub const MAX_SEQUENCE_DELAY: Duration = Duration::from_millis(3_000);
+
+/// 每个触发方式对应一串按顺序执行的动作。空序列表示该触发方式未配置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ButtonActions {
-    pub single: ButtonAction,
-    pub double: ButtonAction,
-    pub long: ButtonAction,
-}
-
-impl Default for ButtonActions {
-    fn default() -> Self {
-        Self {
-            single: ButtonAction::Disabled,
-            double: ButtonAction::Disabled,
-            long: ButtonAction::Disabled,
-        }
-    }
+    pub single: Vec<ButtonAction>,
+    pub double: Vec<ButtonAction>,
+    pub long: Vec<ButtonAction>,
 }
 
 impl ButtonActions {
-    pub fn trigger(&self, trigger: ButtonTrigger) -> &ButtonAction {
+    /// 单动作的便捷构造（预设方案与测试用）。
+    pub fn single(action: ButtonAction) -> Self {
+        Self {
+            single: vec![action],
+            ..Self::default()
+        }
+    }
+
+    pub fn trigger(&self, trigger: ButtonTrigger) -> &[ButtonAction] {
         match trigger {
             ButtonTrigger::Single => &self.single,
             ButtonTrigger::Double => &self.double,
@@ -300,11 +503,22 @@ impl ButtonActions {
         }
     }
 
+    fn trigger_mut(&mut self, trigger: ButtonTrigger) -> &mut Vec<ButtonAction> {
+        match trigger {
+            ButtonTrigger::Single => &mut self.single,
+            ButtonTrigger::Double => &mut self.double,
+            ButtonTrigger::Long => &mut self.long,
+        }
+    }
+
     /// 任一触发方式配置了动作：key_gate 以此决定是否吞掉该按键的原始键入。
     pub fn any_configured(&self) -> bool {
-        self.single != ButtonAction::Disabled
-            || self.double != ButtonAction::Disabled
-            || self.long != ButtonAction::Disabled
+        !self.single.is_empty() || !self.double.is_empty() || !self.long.is_empty()
+    }
+
+    /// 该触发方式是否配置了动作。
+    pub fn configured(&self, trigger: ButtonTrigger) -> bool {
+        !self.trigger(trigger).is_empty()
     }
 }
 
@@ -318,25 +532,42 @@ enum ButtonActionsWire {
     Legacy(ButtonAction),
 }
 
+/// 一格的内容：新格式是动作数组，旧格式是单个动作。ButtonAction 是内部标签
+/// 的对象，与数组在 JSON 形状上无歧义，所以 untagged 可以安全区分。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ActionSequenceWire {
+    Sequence(Vec<ButtonAction>),
+    Single(ButtonAction),
+}
+
+impl From<ActionSequenceWire> for Vec<ButtonAction> {
+    fn from(wire: ActionSequenceWire) -> Self {
+        match wire {
+            ActionSequenceWire::Sequence(actions) => actions,
+            ActionSequenceWire::Single(ButtonAction::Disabled) => Vec::new(),
+            ActionSequenceWire::Single(action) => vec![action],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ButtonActionsCells {
-    single: ButtonAction,
-    double: ButtonAction,
-    long: ButtonAction,
+    single: ActionSequenceWire,
+    double: ActionSequenceWire,
+    long: ActionSequenceWire,
 }
 
 impl From<ButtonActionsWire> for ButtonActions {
     fn from(wire: ButtonActionsWire) -> Self {
         match wire {
             ButtonActionsWire::Cells(cells) => Self {
-                single: cells.single,
-                double: cells.double,
-                long: cells.long,
+                single: cells.single.into(),
+                double: cells.double.into(),
+                long: cells.long.into(),
             },
-            ButtonActionsWire::Legacy(action) => Self {
-                single: action,
-                ..Self::default()
-            },
+            ButtonActionsWire::Legacy(ButtonAction::Disabled) => Self::default(),
+            ButtonActionsWire::Legacy(action) => Self::single(action),
         }
     }
 }
@@ -400,12 +631,53 @@ impl ButtonMappings {
             // 无原生键的按键（返回/电源/TV）配了"原生透传"没有意义：降级为
             // 禁用，与 UI 不提供该选项一致（fail closed，不留死配置）。
             let has_native = native_key(*button).is_some();
-            for action in [&mut actions.single, &mut actions.double, &mut actions.long] {
-                match action {
-                    ButtonAction::Shortcut { chord } => *chord = chord.clone().validated()?,
-                    ButtonAction::Native if !has_native => *action = ButtonAction::Disabled,
-                    _ => {}
+            // 按住快捷键独占按下/松开边沿，不参与手势识别：只有它单独占据
+            // 单击列、且未配双击/长按时成立，否则降级为点按（保留和弦）。
+            let hold_allowed =
+                actions.single.len() == 1 && actions.double.is_empty() && actions.long.is_empty();
+            for trigger in [
+                ButtonTrigger::Single,
+                ButtonTrigger::Double,
+                ButtonTrigger::Long,
+            ] {
+                let keeps_hold = hold_allowed && trigger == ButtonTrigger::Single;
+                let sequence = actions.trigger_mut(trigger);
+                if sequence.len() > MAX_SEQUENCE_STEPS {
+                    return Err(SendInputError::SequenceTooLong(sequence.len()));
                 }
+                let mut total_delay = Duration::ZERO;
+                for action in sequence.iter_mut() {
+                    if !keeps_hold {
+                        if let ButtonAction::HoldShortcut { chord } = action {
+                            let chord = chord.clone();
+                            *action = ButtonAction::Shortcut { chord };
+                        }
+                    }
+                    match action {
+                        ButtonAction::Shortcut { chord } | ButtonAction::HoldShortcut { chord } => {
+                            *chord = chord.clone().validated()?
+                        }
+                        ButtonAction::Text { value } => {
+                            let chars = value.chars().count();
+                            if chars == 0 {
+                                *action = ButtonAction::Disabled;
+                            } else if chars > MAX_TEXT_CHARS {
+                                return Err(SendInputError::TextTooLong(chars));
+                            }
+                        }
+                        ButtonAction::Delay { ms } => {
+                            let capped = Duration::from_millis(u64::from(*ms)).min(MAX_DELAY);
+                            total_delay = (total_delay + capped).min(MAX_SEQUENCE_DELAY);
+                            *ms = capped.as_millis() as u32;
+                        }
+                        ButtonAction::Native if !has_native => *action = ButtonAction::Disabled,
+                        _ => {}
+                    }
+                }
+                // 序列里的"未配置"是噪声：去掉后空序列即代表该触发方式未配置。
+                sequence.retain(|action| *action != ButtonAction::Disabled);
+                // 等待总和超限时，从末尾裁掉多出来的等待，而不是整条拒绝。
+                cap_sequence_delay(sequence);
             }
         }
         Ok(this)
@@ -415,13 +687,9 @@ impl ButtonMappings {
         self.actions.get(&button).cloned().unwrap_or_default()
     }
 
-    #[allow(dead_code)]
-    pub fn action(&self, button: RemoteButton) -> ButtonAction {
-        self.actions(button).single
-    }
-
-    pub fn action_for(&self, button: RemoteButton, trigger: ButtonTrigger) -> ButtonAction {
-        self.actions(button).trigger(trigger).clone()
+    /// 某个触发方式的动作序列（空 = 未配置）。
+    pub fn sequence_for(&self, button: RemoteButton, trigger: ButtonTrigger) -> Vec<ButtonAction> {
+        self.actions(button).trigger(trigger).to_vec()
     }
 
     /// 已配置（任意触发方式有动作）的按键位掩码：key_gate 的无锁快照。
@@ -437,6 +705,21 @@ impl ButtonMappings {
         }
         mask
     }
+}
+
+/// 把序列里等待步骤的总和压到 [`MAX_SEQUENCE_DELAY`] 以内：从前往后累加，
+/// 超出的等待被缩短，缩到零的等待步骤直接去掉。
+fn cap_sequence_delay(sequence: &mut Vec<ButtonAction>) {
+    let mut budget = MAX_SEQUENCE_DELAY;
+    for action in sequence.iter_mut() {
+        if let ButtonAction::Delay { ms } = action {
+            let wanted = Duration::from_millis(u64::from(*ms));
+            let granted = wanted.min(budget);
+            budget -= granted;
+            *ms = granted.as_millis() as u32;
+        }
+    }
+    sequence.retain(|action| !matches!(action, ButtonAction::Delay { ms: 0 }));
 }
 
 /// 遥控器按键的"原生 Windows 动作"等价键：按键映射引擎的泄漏对冲依据
@@ -457,7 +740,12 @@ pub fn native_key(button: RemoteButton) -> Option<KeyCode> {
         RemoteButton::VolumeMute => KeyCode::VolumeMute,
         RemoteButton::VolumeUp => KeyCode::VolumeUp,
         RemoteButton::VolumeDown => KeyCode::VolumeDown,
-        RemoteButton::Back | RemoteButton::Tv | RemoteButton::Power => return None,
+        // 厂商键与应用直达键在 Windows 上没有对应动作。
+        RemoteButton::Back
+        | RemoteButton::Tv
+        | RemoteButton::Power
+        | RemoteButton::Youtube
+        | RemoteButton::Netflix => return None,
     })
 }
 
@@ -684,6 +972,60 @@ pub fn send_key_tap_with(
     })
 }
 
+/// 点按和弦并在 DOWN 与 UP 之间保持 `hold`：DOWN 全部一批、保持、UP 反序
+/// 一批。与 [`send_key_tap_with`] 的区别只有中间那段保持——和弦内部仍是零
+/// 间隔，不改变组合键语义。`hold` 为零时退化为两批紧邻提交。
+pub fn send_key_tap_held_with(
+    chord: &KeyChord,
+    hold: Duration,
+    mut sender: impl FnMut(&[PlannedKeyEvent]) -> Result<usize, String>,
+) -> Result<usize, SendInputError> {
+    let down_events = plan_key_down(chord)?;
+    let up_events = plan_key_up(chord)?;
+
+    let sent_down = match sender(&down_events) {
+        Ok(sent) => sent,
+        Err(error) => {
+            best_effort_release(down_events.iter().rev().map(|event| event.key), &mut sender);
+            return Err(SendInputError::Backend(error));
+        }
+    };
+    if sent_down < down_events.len() {
+        best_effort_release(
+            down_events[..sent_down].iter().rev().map(|event| event.key),
+            &mut sender,
+        );
+        return Err(SendInputError::PartialDelivery {
+            sent: sent_down,
+            expected: down_events.len() + up_events.len(),
+        });
+    }
+
+    if !hold.is_zero() {
+        thread::sleep(hold);
+    }
+
+    let sent_up = match sender(&up_events) {
+        Ok(sent) => sent,
+        Err(error) => {
+            best_effort_release(down_events.iter().rev().map(|event| event.key), &mut sender);
+            return Err(SendInputError::Backend(error));
+        }
+    };
+    if sent_up < up_events.len() {
+        // UP 没发全：剩下的键还按着，逐个补松开。
+        best_effort_release(
+            up_events[sent_up..].iter().map(|event| event.key),
+            &mut sender,
+        );
+        return Err(SendInputError::PartialDelivery {
+            sent: sent_down + sent_up,
+            expected: down_events.len() + up_events.len(),
+        });
+    }
+    Ok(sent_down + sent_up)
+}
+
 fn best_effort_release(
     keys: impl Iterator<Item = KeyCode>,
     sender: &mut impl FnMut(&[PlannedKeyEvent]) -> Result<usize, String>,
@@ -742,6 +1084,10 @@ pub enum SendInputError {
     ChordTooLong(usize),
     #[error("a shortcut contains duplicate key {0:?}")]
     DuplicateKey(KeyCode),
+    #[error("a text action may contain at most {MAX_TEXT_CHARS} characters, got {0}")]
+    TextTooLong(usize),
+    #[error("an action sequence may contain at most {MAX_SEQUENCE_STEPS} steps, got {0}")]
+    SequenceTooLong(usize),
     #[error("SendInput delivered only {sent}/{expected} events; release rollback was attempted")]
     PartialDelivery { sent: usize, expected: usize },
     #[error("SendInput backend failed with unknown delivery state: {0}")]
@@ -768,6 +1114,363 @@ mod tests {
     }
 
     #[test]
+    fn held_tap_submits_downs_then_ups_and_keeps_chord_order() {
+        let batches = std::cell::RefCell::new(Vec::new());
+        let sent = send_key_tap_held_with(
+            &chord(&[KeyCode::LeftControl, KeyCode::C]),
+            Duration::ZERO,
+            |events| {
+                batches.borrow_mut().push(events.to_vec());
+                Ok(events.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(sent, 4);
+        let batches = batches.into_inner();
+        // 两批：DOWN 全部、UP 反序。和弦内部零间隔，组合键语义不变。
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|event| (event.key, event.is_key_up))
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::LeftControl, false), (KeyCode::C, false)]
+        );
+        assert_eq!(
+            batches[1]
+                .iter()
+                .map(|event| (event.key, event.is_key_up))
+                .collect::<Vec<_>>(),
+            vec![(KeyCode::C, true), (KeyCode::LeftControl, true)]
+        );
+    }
+
+    #[test]
+    fn held_tap_releases_everything_when_the_up_batch_is_rejected() {
+        let released = std::cell::RefCell::new(Vec::new());
+        let calls = std::cell::Cell::new(0);
+        let result = send_key_tap_held_with(
+            &chord(&[KeyCode::LeftAlt, KeyCode::Tab]),
+            Duration::ZERO,
+            |events| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Ok(events.len());
+                }
+                if calls.get() == 2 {
+                    return Err("UP 批被拒（测试）".to_owned());
+                }
+                released
+                    .borrow_mut()
+                    .extend(events.iter().map(|event| (event.key, event.is_key_up)));
+                Ok(events.len())
+            },
+        );
+        assert!(matches!(result, Err(SendInputError::Backend(_))));
+        // 按下的键必须全部补松开，且反序，否则会粘在 OS 键态上。
+        assert_eq!(
+            released.into_inner(),
+            vec![(KeyCode::Tab, true), (KeyCode::LeftAlt, true)]
+        );
+    }
+
+    #[test]
+    fn injection_hold_defaults_stay_within_bounds() {
+        assert!(DEFAULT_INJECTION_HOLD <= MAX_INJECTION_HOLD);
+        // 30ms 保持不得把方向键的 100ms 连发间隔挤爆。
+        assert!(DEFAULT_INJECTION_HOLD < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn single_action_cells_and_sequences_both_load() {
+        use crate::raw_input::RemoteButton;
+
+        // 旧三列格式：每格是单个动作对象。
+        let old = serde_json::json!({
+            "actions": {
+                "ok": {
+                    "single": { "type": "shortcut", "chord": { "keys": ["enter"] } },
+                    "double": { "type": "disabled" },
+                    "long": { "type": "disabled" }
+                }
+            }
+        });
+        let mappings: ButtonMappings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            mappings.actions(RemoteButton::Ok).single,
+            vec![ButtonAction::Shortcut {
+                chord: chord(&[KeyCode::Enter])
+            }]
+        );
+        assert!(mappings.actions(RemoteButton::Ok).double.is_empty());
+
+        // 新格式：每格是动作数组。
+        let new = serde_json::json!({
+            "actions": {
+                "ok": {
+                    "single": [
+                        { "type": "text", "value": "收到" },
+                        { "type": "delay", "ms": 30 },
+                        { "type": "shortcut", "chord": { "keys": ["enter"] } }
+                    ],
+                    "double": [],
+                    "long": []
+                }
+            }
+        });
+        let mappings: ButtonMappings = serde_json::from_value(new).unwrap();
+        let sequence = mappings.actions(RemoteButton::Ok).single;
+        assert_eq!(sequence.len(), 3);
+        assert_eq!(sequence[1], ButtonAction::Delay { ms: 30 });
+        // 归一化不改动合法序列。
+        assert_eq!(
+            mappings
+                .clone()
+                .normalized()
+                .unwrap()
+                .actions(RemoteButton::Ok)
+                .single,
+            sequence
+        );
+    }
+
+    #[test]
+    fn sequences_round_trip_and_reject_overlong_chains() {
+        use crate::raw_input::RemoteButton;
+
+        let step = || ButtonAction::Shortcut {
+            chord: chord(&[KeyCode::A]),
+        };
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![step(); MAX_SEQUENCE_STEPS],
+                ..ButtonActions::default()
+            },
+        );
+        let encoded = serde_json::to_string(&mappings).unwrap();
+        let decoded: ButtonMappings = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded
+                .normalized()
+                .unwrap()
+                .actions(RemoteButton::Ok)
+                .single
+                .len(),
+            MAX_SEQUENCE_STEPS
+        );
+
+        let mut too_long = ButtonMappings::default();
+        too_long.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![step(); MAX_SEQUENCE_STEPS + 1],
+                ..ButtonActions::default()
+            },
+        );
+        assert_eq!(
+            too_long.normalized(),
+            Err(SendInputError::SequenceTooLong(MAX_SEQUENCE_STEPS + 1))
+        );
+    }
+
+    #[test]
+    fn delays_are_capped_individually_and_in_total() {
+        use crate::raw_input::RemoteButton;
+
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![
+                    ButtonAction::Delay { ms: 9_999 },
+                    ButtonAction::Delay { ms: 2_000 },
+                    ButtonAction::Delay { ms: 2_000 },
+                ],
+                ..ButtonActions::default()
+            },
+        );
+        let sequence = mappings
+            .normalized()
+            .unwrap()
+            .actions(RemoteButton::Ok)
+            .single;
+        // 单步压到 MAX_DELAY；总和压到 MAX_SEQUENCE_DELAY；被压成零的步骤去掉。
+        assert_eq!(
+            sequence,
+            vec![
+                ButtonAction::Delay {
+                    ms: MAX_DELAY.as_millis() as u32
+                },
+                ButtonAction::Delay {
+                    ms: (MAX_SEQUENCE_DELAY - MAX_DELAY).as_millis() as u32
+                },
+            ]
+        );
+        let total: u64 = sequence
+            .iter()
+            .filter_map(|action| match action {
+                ButtonAction::Delay { ms } => Some(u64::from(*ms)),
+                _ => None,
+            })
+            .sum();
+        assert!(Duration::from_millis(total) <= MAX_SEQUENCE_DELAY);
+    }
+
+    #[test]
+    fn disabled_steps_are_dropped_from_sequences() {
+        use crate::raw_input::RemoteButton;
+
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![
+                    ButtonAction::Disabled,
+                    ButtonAction::Native,
+                    ButtonAction::Disabled,
+                ],
+                double: vec![ButtonAction::Disabled],
+                ..ButtonActions::default()
+            },
+        );
+        let normalized = mappings.normalized().unwrap();
+        assert_eq!(
+            normalized.actions(RemoteButton::Ok).single,
+            vec![ButtonAction::Native]
+        );
+        // 整格只剩"未配置"：空序列即未配置，不参与门控吞键。
+        assert!(normalized.actions(RemoteButton::Ok).double.is_empty());
+        assert!(normalized
+            .actions(RemoteButton::Ok)
+            .configured(ButtonTrigger::Single));
+        assert!(!normalized
+            .actions(RemoteButton::Ok)
+            .configured(ButtonTrigger::Double));
+    }
+
+    #[test]
+    fn unknown_action_type_degrades_to_disabled_instead_of_failing_the_file() {
+        let action: ButtonAction =
+            serde_json::from_str(r#"{"type":"some_future_action","payload":1}"#).unwrap();
+        assert_eq!(action, ButtonAction::Disabled);
+        assert_eq!(
+            serde_json::to_string(&ButtonAction::Disabled).unwrap(),
+            r#"{"type":"disabled"}"#
+        );
+    }
+
+    #[test]
+    fn mouse_and_text_actions_round_trip_through_json() {
+        let mouse = ButtonAction::Mouse {
+            kind: MouseAction::WheelUp,
+        };
+        let encoded = serde_json::to_string(&mouse).unwrap();
+        assert_eq!(encoded, r#"{"type":"mouse","kind":"wheel_up"}"#);
+        assert_eq!(
+            serde_json::from_str::<ButtonAction>(&encoded).unwrap(),
+            mouse
+        );
+
+        let text = ButtonAction::Text {
+            value: "你好".to_owned(),
+        };
+        let encoded = serde_json::to_string(&text).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ButtonAction>(&encoded).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn hold_shortcut_survives_only_in_the_single_column_without_other_triggers() {
+        use crate::raw_input::RemoteButton;
+
+        let hold = ButtonAction::HoldShortcut {
+            chord: chord(&[KeyCode::Space]),
+        };
+        let mut mappings = ButtonMappings::default();
+        // 独占单击列：保留。
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![hold.clone()],
+                ..ButtonActions::default()
+            },
+        );
+        // 与长按共存：降级为点按，和弦不丢。
+        mappings.actions.insert(
+            RemoteButton::Up,
+            ButtonActions {
+                single: vec![hold.clone()],
+                double: Vec::new(),
+                long: vec![ButtonAction::Native],
+            },
+        );
+        // 双击列：降级为点按。
+        mappings.actions.insert(
+            RemoteButton::Down,
+            ButtonActions {
+                double: vec![hold.clone()],
+                ..ButtonActions::default()
+            },
+        );
+
+        let normalized = mappings.normalized().unwrap();
+        assert_eq!(normalized.actions(RemoteButton::Ok).single, vec![hold]);
+        assert_eq!(
+            normalized.actions(RemoteButton::Up).single,
+            vec![ButtonAction::Shortcut {
+                chord: chord(&[KeyCode::Space])
+            }]
+        );
+        assert_eq!(
+            normalized.actions(RemoteButton::Down).double,
+            vec![ButtonAction::Shortcut {
+                chord: chord(&[KeyCode::Space])
+            }]
+        );
+    }
+
+    #[test]
+    fn text_action_drops_when_empty_and_is_rejected_when_overlong() {
+        use crate::raw_input::RemoteButton;
+
+        let with_text = |value: String| {
+            let mut mappings = ButtonMappings::default();
+            mappings.actions.insert(
+                RemoteButton::Ok,
+                ButtonActions::single(ButtonAction::Text { value }),
+            );
+            mappings
+        };
+
+        assert_eq!(
+            with_text(String::new())
+                .normalized()
+                .unwrap()
+                .actions(RemoteButton::Ok)
+                .single,
+            Vec::new()
+        );
+        assert_eq!(
+            with_text("好".repeat(MAX_TEXT_CHARS))
+                .normalized()
+                .unwrap()
+                .actions(RemoteButton::Ok)
+                .single,
+            vec![ButtonAction::Text {
+                value: "好".repeat(MAX_TEXT_CHARS)
+            }]
+        );
+        assert_eq!(
+            with_text("好".repeat(MAX_TEXT_CHARS + 1)).normalized(),
+            Err(SendInputError::TextTooLong(MAX_TEXT_CHARS + 1))
+        );
+    }
+
+    #[test]
     fn recognizes_only_the_windows_l_system_action() {
         assert!(chord(&[KeyCode::LeftWindows, KeyCode::L]).is_lock_workstation());
         assert!(chord(&[KeyCode::L, KeyCode::RightWindows]).is_lock_workstation());
@@ -784,22 +1487,22 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Up,
             ButtonActions {
-                single: ButtonAction::Native,
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Native],
+                double: Vec::new(),
+                long: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::LeftControl, KeyCode::LeftShift, KeyCode::W],
                     },
-                },
+                }],
             },
         );
         // TV 无原生键：Native 归一化降级为 Disabled。
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
-                single: ButtonAction::Native,
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Disabled,
+                single: vec![ButtonAction::Native],
+                double: Vec::new(),
+                long: Vec::new(),
             },
         );
 
@@ -809,21 +1512,21 @@ mod tests {
         let normalized = decoded.normalized().unwrap();
 
         assert_eq!(
-            normalized.action_for(RemoteButton::Up, ButtonTrigger::Single),
-            ButtonAction::Native
+            normalized.sequence_for(RemoteButton::Up, ButtonTrigger::Single),
+            vec![ButtonAction::Native]
         );
         assert_eq!(
-            normalized.action_for(RemoteButton::Up, ButtonTrigger::Long),
-            ButtonAction::Shortcut {
+            normalized.sequence_for(RemoteButton::Up, ButtonTrigger::Long),
+            vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::LeftControl, KeyCode::LeftShift, KeyCode::W],
                 }
-            }
+            }]
         );
         // TV 的 Native 被降级为 Disabled（无原生键，fail closed）。
         assert_eq!(
-            normalized.action_for(RemoteButton::Tv, ButtonTrigger::Single),
-            ButtonAction::Disabled
+            normalized.sequence_for(RemoteButton::Tv, ButtonTrigger::Single),
+            Vec::new()
         );
     }
 
@@ -835,7 +1538,7 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Up,
             ButtonActions {
-                single: ButtonAction::Native,
+                single: vec![ButtonAction::Native],
                 ..ButtonActions::default()
             },
         );
@@ -1142,8 +1845,8 @@ mod tests {
     fn missing_button_mapping_is_disabled_and_invalid_chords_fail_closed() {
         let mappings = ButtonMappings::default();
         assert_eq!(
-            mappings.action_for(RemoteButton::Up, ButtonTrigger::Single),
-            ButtonAction::Disabled
+            mappings.sequence_for(RemoteButton::Up, ButtonTrigger::Single),
+            Vec::new()
         );
         assert_eq!(mappings.mapped_mask(), 0);
 
@@ -1151,7 +1854,7 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Up,
             ButtonActions {
-                single: ButtonAction::Shortcut { chord: chord(&[]) },
+                single: vec![ButtonAction::Shortcut { chord: chord(&[]) }],
                 ..ButtonActions::default()
             },
         );
@@ -1171,19 +1874,19 @@ mod tests {
         assert!(mappings.enabled, "缺省 enabled 必须默认开启");
         assert_eq!(
             mappings.actions(RemoteButton::Ok).single,
-            ButtonAction::Shortcut {
+            vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::Enter]
                 }
-            }
+            }]
         );
         assert_eq!(
-            mappings.action_for(RemoteButton::Ok, ButtonTrigger::Double),
-            ButtonAction::Disabled
+            mappings.sequence_for(RemoteButton::Ok, ButtonTrigger::Double),
+            Vec::new()
         );
         assert_eq!(
-            mappings.action_for(RemoteButton::Ok, ButtonTrigger::Long),
-            ButtonAction::Disabled
+            mappings.sequence_for(RemoteButton::Ok, ButtonTrigger::Long),
+            Vec::new()
         );
         assert_eq!(
             mappings.mapped_mask(),
@@ -1198,9 +1901,9 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Back,
             ButtonActions {
-                long: ButtonAction::Shortcut {
+                long: vec![ButtonAction::Shortcut {
                     chord: chord(&[KeyCode::Escape]),
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -1220,13 +1923,13 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: chord(&[KeyCode::LeftWindows, KeyCode::D]),
-                },
-                double: ButtonAction::Disabled,
-                long: ButtonAction::Shortcut {
+                }],
+                double: Vec::new(),
+                long: vec![ButtonAction::Shortcut {
                     chord: chord(&[KeyCode::Control, KeyCode::C]),
-                },
+                }],
             },
         );
         let encoded = serde_json::to_string(&mappings).unwrap();
@@ -1240,9 +1943,9 @@ mod tests {
         // 可达），normalized() 不再剥离；返回无原生键，透传降级为禁用。
         let mut mappings = ButtonMappings::default();
         let single_escape = ButtonActions {
-            single: ButtonAction::Shortcut {
+            single: vec![ButtonAction::Shortcut {
                 chord: chord(&[KeyCode::Escape]),
-            },
+            }],
             ..ButtonActions::default()
         };
         mappings
@@ -1258,26 +1961,26 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Back,
             ButtonActions {
-                single: ButtonAction::Native,
-                double: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Native],
+                double: vec![ButtonAction::Shortcut {
                     chord: chord(&[KeyCode::Escape]),
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
         mappings.actions.insert(
             RemoteButton::VolumeUp,
             ButtonActions {
-                single: ButtonAction::Native,
+                single: vec![ButtonAction::Native],
                 ..ButtonActions::default()
             },
         );
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: chord(&[KeyCode::LeftWindows, KeyCode::D]),
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -1302,12 +2005,12 @@ mod tests {
         );
         assert_eq!(
             normalized.actions(RemoteButton::Back).single,
-            ButtonAction::Disabled,
+            Vec::new(),
             "返回无原生键，透传降级为禁用"
         );
         assert_eq!(
             normalized.actions(RemoteButton::VolumeUp).single,
-            ButtonAction::Native,
+            vec![ButtonAction::Native],
             "音量+有媒体原生键，透传保留"
         );
         let expected_mask = (1u64 << RemoteButton::Left.ordinal())

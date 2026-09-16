@@ -14,6 +14,7 @@ const emptyConnection: ConnectionSnapshot = {
   phase: "idle",
   remoteName: null,
   remoteModel: "unknown",
+  batteryLevel: null,
   capabilities: null,
   voiceState: "idle",
   decodedSamples: 0,
@@ -48,6 +49,7 @@ const runtime: RuntimeSnapshot = {
     audio: emptyAudio,
     rawInput: {
       phase: "stopped",
+    profileId: null,
       matchedDeviceCount: 0,
       rawEventCount: 0,
       semanticEdgeCount: 0,
@@ -84,6 +86,12 @@ const mocks = vi.hoisted(() => ({
   selectAudioEndpoint: vi.fn(),
   openVbCableDownloadPage: vi.fn(),
   getVoiceHoldHotkey: vi.fn(),
+  getVoiceEnhance: vi.fn(),
+  getBorrowDefaultCapture: vi.fn(),
+  setBorrowDefaultCapture: vi.fn(),
+  checkStaleDefaultCapture: vi.fn(),
+  detectImeVoiceHotkey: vi.fn(),
+  setVoiceEnhance: vi.fn(),
   setVoiceHoldHotkey: vi.fn(),
   startShortcutCapture: vi.fn(),
   stopShortcutCapture: vi.fn(),
@@ -95,6 +103,12 @@ vi.mock("../lib/bridge", async (importOriginal) => {
   return {
     ...original,
     getConnectionSnapshot: mocks.getConnectionSnapshot,
+    getVoiceEnhance: mocks.getVoiceEnhance,
+    getBorrowDefaultCapture: mocks.getBorrowDefaultCapture,
+    setBorrowDefaultCapture: mocks.setBorrowDefaultCapture,
+    checkStaleDefaultCapture: mocks.checkStaleDefaultCapture,
+    detectImeVoiceHotkey: mocks.detectImeVoiceHotkey,
+    setVoiceEnhance: mocks.setVoiceEnhance,
     getAudioSnapshot: mocks.getAudioSnapshot,
     listAudioEndpoints: mocks.listAudioEndpoints,
     selectAudioEndpoint: mocks.selectAudioEndpoint,
@@ -120,6 +134,16 @@ describe("VB-CABLE first-launch guidance", () => {
       selectedEndpointName: cableEndpoint.name,
     }));
     mocks.openVbCableDownloadPage.mockResolvedValue(undefined);
+    mocks.getVoiceEnhance.mockResolvedValue(false);
+    mocks.getBorrowDefaultCapture.mockResolvedValue(false);
+    mocks.setBorrowDefaultCapture.mockImplementation(async (enabled: boolean) => enabled);
+    mocks.checkStaleDefaultCapture.mockResolvedValue(null);
+    mocks.detectImeVoiceHotkey.mockResolvedValue({
+      chord: { keys: ["right_control"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    mocks.setVoiceEnhance.mockImplementation(async (enabled: boolean) => enabled);
     mocks.getVoiceHoldHotkey.mockResolvedValue({
       chord: { keys: ["left_control", "left_windows"] },
       mode: "hold",
@@ -353,6 +377,93 @@ describe("语音输入快捷键设置", () => {
       mode: "hold",
       activateWetype: true,
     });
+    wrapper.unmount();
+  });
+
+  it("语音工具预设带状态标注：未验证与已知不可用都写在按钮上", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    const presets = wrapper.findAll(".voice-hotkey-presets button");
+    const doubao = presets.find((button) => button.text().includes("豆包输入法"))!;
+    expect(doubao.text()).toContain("已知不可用");
+    const sogou = presets.find((button) => button.text().includes("搜狗语音输入"))!;
+    expect(sogou.text()).toContain("未验证");
+    // 已验证的预设不加标注。
+    const wetype = presets.find((button) => button.text().includes("微信输入法"))!;
+    expect(wetype.text()).not.toContain("未验证");
+    wrapper.unmount();
+  });
+
+  it("从输入法读取热键：读到后直接套用并说明来源", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    await findButton(wrapper, "搜狗语音输入").trigger("click");
+    await flushPromises();
+
+    expect(mocks.detectImeVoiceHotkey).toHaveBeenCalledWith("sogou");
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["right_control"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    expect(wrapper.text()).toContain("已从搜狗语音输入读取到");
+    wrapper.unmount();
+  });
+
+  it("从输入法读取失败：如实显示原因，不改动现有设置", async () => {
+    mocks.detectImeVoiceHotkey.mockRejectedValueOnce(
+      new Error("没有找到搜狗语音输入的配置文件，可能没装或还没设置过语音热键"),
+    );
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+    mocks.setVoiceHoldHotkey.mockClear();
+
+    await findButton(wrapper, "搜狗语音输入").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("没有找到搜狗语音输入的配置文件");
+    expect(mocks.setVoiceHoldHotkey).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it("临时切换默认麦克风：默认关闭，开启后写入设置", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+    const row = wrapper
+      .findAll(".toggle-row")
+      .find((item) => item.text().includes("临时把系统默认麦克风"))!;
+    expect((row.find("input").element as HTMLInputElement).checked).toBe(false);
+    await row.find("input").setValue(true);
+    await flushPromises();
+    expect(mocks.setBorrowDefaultCapture).toHaveBeenCalledWith(true);
+    expect(wrapper.text()).toContain("临时接管系统默认麦克风");
+    wrapper.unmount();
+  });
+
+  it("上次没还原干净时给出提示", async () => {
+    mocks.checkStaleDefaultCapture.mockResolvedValue("CABLE Output (VB-Audio Virtual Cable)");
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+    expect(wrapper.text()).toContain("可能是上次异常退出没还原干净");
+    wrapper.unmount();
+  });
+
+  it("语音增强开关：默认关闭，勾选后写入设置", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    const enhance = wrapper
+      .findAll(".toggle-row")
+      .find((row) => row.text().includes("语音增强"))!;
+    const input = enhance.find("input");
+    expect((input.element as HTMLInputElement).checked).toBe(false);
+
+    await input.setValue(true);
+    await flushPromises();
+    expect(mocks.setVoiceEnhance).toHaveBeenCalledWith(true);
+    expect(wrapper.text()).toContain("语音增强已开启");
     wrapper.unmount();
   });
 

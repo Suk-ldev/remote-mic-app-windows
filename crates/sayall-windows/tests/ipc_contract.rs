@@ -24,6 +24,7 @@ fn rust_serialization_matches_the_shared_windows_runtime_contract() {
                 phase: ConnectionPhase::Ready,
                 remote_name: Some("Xiaomi Bluetooth Remote 2".into()),
                 remote_model: RemoteModel::Rc001,
+                battery_level: Some(78),
                 capabilities: Some(AtvvCapabilities {
                     version: 256,
                     codecs: 1,
@@ -50,6 +51,7 @@ fn rust_serialization_matches_the_shared_windows_runtime_contract() {
             },
             raw_input: RawInputSnapshot {
                 phase: RawInputPhase::Ready,
+                profile_id: Some("xiaomi".to_owned()),
                 matched_device_count: 1,
                 raw_event_count: 12,
                 semantic_edge_count: 8,

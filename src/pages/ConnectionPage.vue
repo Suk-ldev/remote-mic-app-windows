@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import type {
+  ImeTool,
   AudioEndpoint,
   AudioSnapshot,
   ConnectionSnapshot,
@@ -20,6 +21,12 @@ import {
   domCodeToKeyCode,
   getAudioSnapshot,
   getConnectionSnapshot,
+  detectImeVoiceHotkey,
+  imeToolLabels,
+  getVoiceEnhance,
+  getBorrowDefaultCapture,
+  setBorrowDefaultCapture,
+  checkStaleDefaultCapture,
   getVoiceHoldHotkey,
   isModifierKeyCode,
   listAudioEndpoints,
@@ -27,6 +34,7 @@ import {
   remoteModelLabel,
   scanPairedRemotes,
   selectAudioEndpoint,
+  setVoiceEnhance,
   setVoiceHoldHotkey,
   startShortcutCapture,
   stopShortcutCapture,
@@ -41,6 +49,7 @@ const emptyConnection = (): ConnectionSnapshot => ({
   phase: "idle",
   remoteName: null,
   remoteModel: "unknown",
+  batteryLevel: null,
   capabilities: null,
   voiceState: "idle",
   decodedSamples: 0,
@@ -77,6 +86,13 @@ const openingVbCablePage = ref(false);
 const audioMessage = ref("尚未读取语音设备");
 const voiceHotkey = ref<VoiceHotkeySettings>(disabledVoiceHotkey());
 const savingVoiceHotkey = ref(false);
+const voiceEnhance = ref(false);
+const savingVoiceEnhance = ref(false);
+const detectingIme = ref(false);
+const borrowDefaultCapture = ref(false);
+const savingBorrowCapture = ref(false);
+const staleCaptureName = ref<string | null>(null);
+const IME_TOOLS: ImeTool[] = ["sogou", "doubao"];
 const voiceHotkeyMessage = ref("尚未读取快捷键设置");
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -89,6 +105,12 @@ interface VoiceHotkeyPreset {
   id: string;
   label: string;
   hint: string;
+  /**
+   * verified = 本项目或该工具自己的配置/日志已确认；
+   * untested = 照该工具的公开默认值填，未在真机确认；
+   * blocked  = 已知不可用（该工具会丢弃程序注入的按键）。
+   */
+  status: "verified" | "untested" | "blocked";
   settings: VoiceHotkeySettings;
 }
 
@@ -97,6 +119,7 @@ const voiceHotkeyPresets: VoiceHotkeyPreset[] = [
     id: "wetype",
     label: "微信输入法",
     hint: "左 Ctrl + 左 Win 按住说话（微信输入法默认语音热键）",
+    status: "verified",
     settings: {
       chord: { keys: ["left_control", "left_windows"] },
       mode: "hold",
@@ -106,16 +129,45 @@ const voiceHotkeyPresets: VoiceHotkeyPreset[] = [
   {
     id: "windows-voice",
     label: "Windows 语音输入",
-    hint: "Win + H 单次触发（系统自带语音输入）",
+    hint: "Win + H 单次触发（系统自带、开关式，所以触发方式必须是单次触发）",
+    status: "verified",
     settings: { chord: { keys: ["left_windows", "h"] }, mode: "toggle", activateWetype: false },
+  },
+  {
+    id: "qianwen",
+    label: "千问输入法",
+    hint: "按住右 Alt。需要先在千问里允许接收程序发送的按键，否则它会丢弃注入的热键",
+    status: "untested",
+    settings: { chord: { keys: ["right_alt"] }, mode: "hold", activateWetype: false },
+  },
+  {
+    id: "sogou",
+    label: "搜狗语音输入",
+    hint: "按住右 Ctrl。与千问的右 Alt 不冲突，两者可同时安装",
+    status: "untested",
+    settings: { chord: { keys: ["right_control"] }, mode: "hold", activateWetype: false },
+  },
+  {
+    id: "doubao",
+    label: "豆包输入法",
+    hint: "按住右 Alt。已知不可用：豆包会拦截程序注入的按键，绕开它需要挂进它的进程，本程序不做这种事",
+    status: "blocked",
+    settings: { chord: { keys: ["right_alt"] }, mode: "hold", activateWetype: false },
   },
   {
     id: "off",
     label: "关闭",
     hint: "语音键只把声音送进虚拟声卡，不注入任何快捷键",
+    status: "verified",
     settings: disabledVoiceHotkey(),
   },
 ];
+
+const voiceHotkeyStatusLabels: Record<VoiceHotkeyPreset["status"], string> = {
+  verified: "",
+  untested: "未验证",
+  blocked: "已知不可用",
+};
 
 const voiceHotkeyKeysLabel = computed(() => voiceHoldHotkeyLabel(voiceHotkey.value.chord));
 
@@ -175,6 +227,72 @@ async function applyVoiceHotkeyMode(mode: VoiceHotkeyMode) {
 async function applyActivateWetype(activateWetype: boolean) {
   if (!voiceHotkey.value.chord) return;
   await saveVoiceHotkey({ ...voiceHotkey.value, activateWetype });
+}
+
+/**
+ * 从输入法自己的配置里读出语音热键并直接套用，省掉"两边手动对齐"。
+ * 读不到时如实显示原因，不改动现有设置。
+ */
+async function detectFromIme(tool: ImeTool) {
+  detectingIme.value = true;
+  try {
+    const detected = await detectImeVoiceHotkey(tool);
+    await saveVoiceHotkey(
+      detected,
+      `已从${imeToolLabels[tool]}读取到 ${voiceHoldHotkeyLabel(detected.chord)}，并设为按住说话`,
+    );
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    detectingIme.value = false;
+  }
+}
+
+async function refreshBorrowDefaultCapture() {
+  try {
+    borrowDefaultCapture.value = await getBorrowDefaultCapture();
+    staleCaptureName.value = await checkStaleDefaultCapture();
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function applyBorrowDefaultCapture(enabled: boolean) {
+  savingBorrowCapture.value = true;
+  try {
+    borrowDefaultCapture.value = await setBorrowDefaultCapture(enabled);
+    voiceHotkeyMessage.value = borrowDefaultCapture.value
+      ? "已开启：按住语音键期间临时接管系统默认麦克风，松开还原"
+      : "已关闭：请在语音工具里把麦克风设为 CABLE Output";
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+    await refreshBorrowDefaultCapture();
+  } finally {
+    savingBorrowCapture.value = false;
+  }
+}
+
+async function refreshVoiceEnhance() {
+  try {
+    voiceEnhance.value = await getVoiceEnhance();
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function applyVoiceEnhance(enabled: boolean) {
+  savingVoiceEnhance.value = true;
+  try {
+    voiceEnhance.value = await setVoiceEnhance(enabled);
+    voiceHotkeyMessage.value = voiceEnhance.value
+      ? "语音增强已开启，下一段语音生效"
+      : "语音增强已关闭，恢复固定增益";
+  } catch (error) {
+    voiceHotkeyMessage.value = error instanceof Error ? error.message : String(error);
+    await refreshVoiceEnhance();
+  } finally {
+    savingVoiceEnhance.value = false;
+  }
 }
 
 async function refreshVoiceHotkey() {
@@ -522,6 +640,8 @@ onMounted(() => {
   void refreshConnection();
   void initializeAudio();
   void refreshVoiceHotkey();
+  void refreshVoiceEnhance();
+  void refreshBorrowDefaultCapture();
   pollTimer = setInterval(() => {
     void refreshConnection();
     void refreshAudio();
@@ -634,6 +754,9 @@ onUnmounted(() => {
             @click="applyVoiceHotkeyPreset(preset)"
           >
             {{ preset.label }}
+            <small v-if="voiceHotkeyStatusLabels[preset.status]" class="voice-preset-status">
+              {{ voiceHotkeyStatusLabels[preset.status] }}
+            </small>
           </button>
           <button
             class="secondary-button"
@@ -647,6 +770,23 @@ onUnmounted(() => {
           <span v-if="capturingHotkey" class="capture-display">
             {{ captureDisplay.length ? voiceHoldHotkeyLabel({ keys: captureDisplay }) : "请按下快捷键，松开即录入" }}
           </span>
+        </div>
+        <div class="button-row ime-detect-row">
+          <span class="muted">从输入法读取：</span>
+          <button
+            v-for="tool in IME_TOOLS"
+            :key="tool"
+            class="secondary-button"
+            type="button"
+            :title="`读取${imeToolLabels[tool]}当前配置的按住型语音热键并套用`"
+            :disabled="detectingIme || savingVoiceHotkey || capturingHotkey || !runtime?.platform.windowsApiAvailable"
+            @click="detectFromIme(tool)"
+          >
+            {{ imeToolLabels[tool] }}
+          </button>
+          <small class="muted">
+            微信输入法没有可读的配置文件，仍需按上面的说明手动核对。
+          </small>
         </div>
         <div class="voice-hotkey-modes" role="group" aria-label="触发方式">
           <button
@@ -677,6 +817,31 @@ onUnmounted(() => {
           />
           <span>触发前自动切到微信输入法（只有微信输入法需要；Typeless 等独立应用请保持关闭）</span>
         </label>
+        <label class="toggle-row voice-hotkey-ime">
+          <input
+            type="checkbox"
+            :checked="voiceEnhance"
+            :disabled="savingVoiceEnhance || !runtime?.platform.windowsApiAvailable"
+            @change="applyVoiceEnhance(($event.target as HTMLInputElement).checked)"
+          />
+          <span>语音增强：滤掉低频噪声并自动调平音量（开启后音量由自动增益接管，对下一段语音生效）</span>
+        </label>
+        <label class="toggle-row voice-hotkey-ime">
+          <input
+            type="checkbox"
+            :checked="borrowDefaultCapture"
+            :disabled="savingBorrowCapture || !runtime?.platform.windowsApiAvailable"
+            @change="applyBorrowDefaultCapture(($event.target as HTMLInputElement).checked)"
+          />
+          <span>
+            语音期间临时把系统默认麦克风切到虚拟声卡，松开还原（开启后不必在语音工具里改麦克风；
+            会影响同时在录音的会议、录屏等程序，且走的是未公开接口，默认关闭）
+          </span>
+        </label>
+        <p v-if="staleCaptureName" class="error-text">
+          检测到系统默认麦克风目前是「{{ staleCaptureName }}」，可能是上次异常退出没还原干净。
+          请在 Windows 声音设置里改回你平时用的麦克风。
+        </p>
         <p class="muted scan-summary">{{ voiceHotkeyMessage }}</p>
         <details class="usage-hint-details">
           <summary>微信输入法使用步骤（点开查看）</summary>

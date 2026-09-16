@@ -22,10 +22,34 @@ pub enum RemoteButton {
     VolumeMute,
     VolumeUp,
     VolumeDown,
+    /// Google TV 遥控器的应用直达键；小米遥控器没有这两个键。
+    Youtube,
+    Netflix,
 }
 
 /// 语义按键的稳定顺序：key_gate 的映射位掩码、UI 画布布局都依赖该表。
-pub const ALL_BUTTONS: [RemoteButton; 13] = [
+/// 新机型的专属按键一律追加在末尾——ordinal 进位掩码，插在中间会让
+/// 已保存的门控配置错位。
+pub const ALL_BUTTONS: [RemoteButton; 15] = [
+    RemoteButton::Back,
+    RemoteButton::Ok,
+    RemoteButton::Tv,
+    RemoteButton::Home,
+    RemoteButton::Right,
+    RemoteButton::Left,
+    RemoteButton::Down,
+    RemoteButton::Up,
+    RemoteButton::Menu,
+    RemoteButton::Power,
+    RemoteButton::VolumeMute,
+    RemoteButton::VolumeUp,
+    RemoteButton::VolumeDown,
+    RemoteButton::Youtube,
+    RemoteButton::Netflix,
+];
+
+/// 小米遥控器实际存在的按键（[`crate::remote_profile::XIAOMI`] 用）。
+pub const ALL_BUTTONS_XIAOMI: [RemoteButton; 13] = [
     RemoteButton::Back,
     RemoteButton::Ok,
     RemoteButton::Tv,
@@ -62,7 +86,14 @@ impl RemoteButton {
             | Self::Right
             | Self::VolumeUp
             | Self::VolumeDown => Some(Duration::from_millis(100)),
-            Self::Ok | Self::Tv | Self::Home | Self::Menu | Self::Power | Self::VolumeMute => None,
+            Self::Ok
+            | Self::Tv
+            | Self::Home
+            | Self::Menu
+            | Self::Power
+            | Self::VolumeMute
+            | Self::Youtube
+            | Self::Netflix => None,
         }
     }
 }
@@ -89,6 +120,10 @@ pub enum RawInputPhase {
 #[serde(rename_all = "camelCase")]
 pub struct RawInputSnapshot {
     pub phase: RawInputPhase,
+    /// 已识别的遥控器机型档案 id（[`crate::remote_profile`]）。未开始监听或
+    /// 未匹配到设备时为 None。
+    #[serde(default)]
+    pub profile_id: Option<String>,
     pub matched_device_count: u32,
     pub raw_event_count: u64,
     pub semantic_edge_count: u64,
@@ -134,11 +169,12 @@ pub enum RawInputDecodeError {
 }
 
 pub fn device_path_matches_xiaomi_remote(path: &str) -> bool {
-    let normalized = normalize_device_path(path);
-    let classic = normalized.contains("vid_2717") && normalized.contains("pid_32b8");
-    let ble = (normalized.contains("dev_vid&002717") || normalized.contains("dev_vid&012717"))
-        && normalized.contains("pid&32b8");
-    classic || ble
+    crate::remote_profile::XIAOMI.device_path_matches(path)
+}
+
+/// 任意已收录机型的设备路径（Raw Input 枚举用）。
+pub fn device_path_matches_known_remote(path: &str) -> bool {
+    crate::remote_profile::profile_for_device_path(path).is_some()
 }
 
 pub fn normalize_device_path(path: &str) -> String {
@@ -148,7 +184,7 @@ pub fn normalize_device_path(path: &str) -> String {
 pub fn select_single_device_path(paths: &[String]) -> Result<String, DevicePathError> {
     let matches: Vec<_> = paths
         .iter()
-        .filter(|path| device_path_matches_xiaomi_remote(path))
+        .filter(|path| device_path_matches_known_remote(path))
         .collect();
     match matches.as_slice() {
         [] => Err(DevicePathError::Missing),
@@ -258,13 +294,45 @@ pub fn button_for_keyboard(virtual_key: u16, make_code: u16) -> Option<RemoteBut
     })
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ButtonStateMerger {
     keyboard: BTreeSet<RemoteButton>,
     hid: BTreeSet<RemoteButton>,
+    /// HID usage 按连接中的机型档案解：两个厂商的 usage 分属不同 HID 页、
+    /// 数值会撞车，不能用一张全局表（见 remote_profile 模块文档）。
+    profile: &'static crate::remote_profile::RemoteProfile,
+}
+
+impl Default for ButtonStateMerger {
+    fn default() -> Self {
+        Self {
+            keyboard: BTreeSet::new(),
+            hid: BTreeSet::new(),
+            profile: crate::remote_profile::DEFAULT_PROFILE,
+        }
+    }
 }
 
 impl ButtonStateMerger {
+    /// 切换机型档案：同时清空 HID 侧按下状态（旧档案解出的按键在新档案下
+    /// 没有意义，留着会让释放沿永远等不到）。
+    pub fn set_profile(
+        &mut self,
+        profile: &'static crate::remote_profile::RemoteProfile,
+    ) -> Vec<ButtonEdge> {
+        if std::ptr::eq(self.profile, profile) {
+            return Vec::new();
+        }
+        let before = self.active_buttons();
+        self.profile = profile;
+        self.hid.clear();
+        edges_between(&before, &self.active_buttons())
+    }
+
+    pub fn profile(&self) -> &'static crate::remote_profile::RemoteProfile {
+        self.profile
+    }
+
     pub fn update_keyboard(&mut self, event: RawKeyboardEvent) -> Vec<ButtonEdge> {
         let Some(button) = event.button() else {
             return Vec::new();
@@ -310,7 +378,10 @@ impl ButtonStateMerger {
     /// 应用一份 HID 报文的 usage 集合（绝对状态），返回语义边沿。
     pub fn update_hid_usages(&mut self, usages: BTreeSet<u16>) -> Vec<ButtonEdge> {
         let before = self.active_buttons();
-        self.hid = usages.into_iter().filter_map(button_for_usage).collect();
+        self.hid = usages
+            .into_iter()
+            .filter_map(|usage| self.profile.button_for_usage(usage))
+            .collect();
         edges_between(&before, &self.active_buttons())
     }
 
@@ -459,6 +530,43 @@ mod tests {
             .update_hid_report(&report(&[0x003E]))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn switching_profile_reinterprets_usages_and_clears_stale_hid_state() {
+        use crate::remote_profile::{GOOGLE_TV, XIAOMI};
+
+        let mut merger = ButtonStateMerger::default();
+        assert_eq!(merger.profile(), &XIAOMI);
+        // 键盘页 0x0052 = 方向上。
+        merger.update_hid_usages(BTreeSet::from([0x0052]));
+        assert_eq!(
+            merger.active_button_set(),
+            BTreeSet::from([RemoteButton::Up])
+        );
+
+        // 换机型：旧档案解出的按下状态必须清掉，否则释放沿永远等不到。
+        let edges = merger.set_profile(&GOOGLE_TV);
+        assert_eq!(
+            edges,
+            vec![ButtonEdge {
+                button: RemoteButton::Up,
+                is_pressed: false
+            }]
+        );
+        assert!(merger.active_button_set().is_empty());
+
+        // 同一个 0x0052 在消费者页不是按键；0x0042 才是方向上。
+        merger.update_hid_usages(BTreeSet::from([0x0052]));
+        assert!(merger.active_button_set().is_empty());
+        merger.update_hid_usages(BTreeSet::from([0x0042]));
+        assert_eq!(
+            merger.active_button_set(),
+            BTreeSet::from([RemoteButton::Up])
+        );
+
+        // 重复设置同一档案是空操作。
+        assert!(merger.set_profile(&GOOGLE_TV).is_empty());
     }
 
     #[test]

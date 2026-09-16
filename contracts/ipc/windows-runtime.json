@@ -12,6 +12,7 @@
       "phase": "ready",
       "remoteName": "Xiaomi Bluetooth Remote 2",
       "remoteModel": "rc001",
+      "batteryLevel": 78,
       "capabilities": {
         "version": 256,
         "codecs": 1,
@@ -38,6 +39,7 @@
     },
     "rawInput": {
       "phase": "ready",
+      "profileId": "xiaomi",
       "matchedDeviceCount": 1,
       "rawEventCount": 12,
       "semanticEdgeCount": 8,

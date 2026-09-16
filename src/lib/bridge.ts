@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 export const VB_CABLE_DOWNLOAD_URL = "https://vb-audio.com/Cable/";
 
@@ -59,7 +59,10 @@ export type RemoteButton =
   | "power"
   | "volume_mute"
   | "volume_up"
-  | "volume_down";
+  | "volume_down"
+  /** Google TV 遥控器的应用直达键；小米遥控器没有这两个键。 */
+  | "youtube"
+  | "netflix";
 
 export type ButtonTrigger = "single" | "double" | "long";
 
@@ -75,6 +78,8 @@ export interface ShortcutCaptureEdge {
 
 export interface RawInputSnapshot {
   phase: RawInputPhase;
+  /** 已识别的遥控器机型档案 id（xiaomi / google_tv）；未匹配时为 null。 */
+  profileId: string | null;
   matchedDeviceCount: number;
   rawEventCount: number;
   semanticEdgeCount: number;
@@ -112,12 +117,47 @@ export const disabledVoiceHotkey = (): VoiceHotkeySettings => ({
   activateWetype: false,
 });
 
+/** 鼠标动作。滚轮挂在单击列且未配双击/长按时按住连滚。 */
+export type MouseAction =
+  | "wheel_up"
+  | "wheel_down"
+  | "wheel_left"
+  | "wheel_right"
+  | "left_click"
+  | "right_click"
+  | "middle_click";
+
+/** 文本动作的字符数上限，与 Rust 侧 MAX_TEXT_CHARS 一致。 */
+export const MAX_TEXT_CHARS = 256;
+
 export type ButtonAction =
   | { type: "disabled" }
   | { type: "shortcut"; chord: KeyChord }
   | { type: "open_app"; target: string }
   /** 透传该键的原生 Windows 动作（上→方向上、确定→回车 等）。 */
-  | { type: "native" };
+  | { type: "native" }
+  | { type: "mouse"; kind: MouseAction }
+  /** 按住快捷键：遥控器按多久就按住多久。只在单击列且无双击/长按时可用。 */
+  | { type: "hold_shortcut"; chord: KeyChord }
+  | { type: "text"; value: string }
+  /** 序列里的等待步骤（毫秒）。 */
+  | { type: "delay"; ms: number };
+
+/** 一个触发格里的动作序列上限，与 Rust 侧 MAX_SEQUENCE_STEPS 一致。 */
+export const MAX_SEQUENCE_STEPS = 8;
+/** 单个等待步骤与整条序列等待总和的上限（毫秒）。 */
+export const MAX_DELAY_MS = 2_000;
+export const MAX_SEQUENCE_DELAY_MS = 3_000;
+
+export const mouseActionLabels: Record<MouseAction, string> = {
+  wheel_up: "滚轮上",
+  wheel_down: "滚轮下",
+  wheel_left: "滚轮左",
+  wheel_right: "滚轮右",
+  left_click: "鼠标左键",
+  right_click: "鼠标右键",
+  middle_click: "鼠标中键",
+};
 
 /** 预设应用条目（list_preset_apps 返回；对齐 Mac PresetApplication）。 */
 export interface PresetAppInfo {
@@ -126,11 +166,11 @@ export interface PresetAppInfo {
   installed: boolean;
 }
 
-/** 每键三列（单击/双击/长按），对齐 Mac 原版 ButtonTrigger。 */
+/** 每键三列（单击/双击/长按），每列是一串按顺序执行的动作。空数组 = 未配置。 */
 export interface ButtonActions {
-  single: ButtonAction;
-  double: ButtonAction;
-  long: ButtonAction;
+  single: ButtonAction[];
+  double: ButtonAction[];
+  long: ButtonAction[];
 }
 
 export interface ButtonMappings {
@@ -174,6 +214,8 @@ export interface ConnectionSnapshot {
   phase: ConnectionPhase;
   remoteName: string | null;
   remoteModel: RemoteModel;
+  /** 遥控器电量百分比（GATT 电池服务）。设备不提供或读取失败时为 null。 */
+  batteryLevel: number | null;
   capabilities: AtvvCapabilities | null;
   voiceState: VoiceSessionState;
   decodedSamples: number;
@@ -237,6 +279,7 @@ export interface DiagnosticReport {
   };
   rawInput: {
     phase: RawInputPhase;
+    profileId: string | null;
     matchedDeviceCount: number;
     rawEventCount: number;
     semanticEdgeCount: number;
@@ -304,6 +347,7 @@ const browserSnapshot: RuntimeSnapshot = {
       phase: "idle",
       remoteName: null,
       remoteModel: "unknown",
+      batteryLevel: null,
       capabilities: null,
       voiceState: "idle",
       decodedSamples: 0,
@@ -323,6 +367,7 @@ const browserSnapshot: RuntimeSnapshot = {
     },
     rawInput: {
       phase: "unsupported",
+      profileId: null,
       matchedDeviceCount: 0,
       rawEventCount: 0,
       semanticEdgeCount: 0,
@@ -391,6 +436,7 @@ export async function getDiagnosticReport(): Promise<DiagnosticReport> {
       },
       rawInput: {
         phase: browserSnapshot.platform.rawInput.phase,
+        profileId: null,
         matchedDeviceCount: 0,
         rawEventCount: 0,
         semanticEdgeCount: 0,
@@ -522,6 +568,171 @@ export async function resetButtonMappings(): Promise<ButtonMappings> {
     return { enabled: true, actions: {} };
   }
   return invoke<ButtonMappings>("reset_button_mappings");
+}
+
+/**
+ * 「前台应用 → 预设方案」绑定。切到绑定的应用时自动套用该方案，离开后回到
+ * 用户保存的配置；自动切换只是临时覆盖，不改写保存的映射。
+ */
+export interface AppProfileBindings {
+  enabled: boolean;
+  /** 进程名（不含路径与 .exe，小写）→ 预设方案 id。 */
+  bindings: Record<string, string>;
+}
+
+export async function getAppProfiles(): Promise<AppProfileBindings> {
+  if (!isTauriRuntime()) return { enabled: false, bindings: {} };
+  return invoke<AppProfileBindings>("get_app_profiles");
+}
+
+export async function saveAppProfiles(
+  bindings: AppProfileBindings,
+): Promise<AppProfileBindings> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法保存应用方案绑定");
+  }
+  return invoke<AppProfileBindings>("save_app_profiles", { bindings });
+}
+
+/** 当前由哪个方案接管（null = 用户自己的配置）。 */
+export async function getActiveAppProfile(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<string | null>("get_active_app_profile");
+}
+
+/**
+ * 语音期间临时把系统默认录音设备切到虚拟声卡，松开还原。默认关闭：
+ * 走的是未公开 COM 接口，且会影响同时在录音的其它程序（会议、录屏）。
+ */
+export async function getBorrowDefaultCapture(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_borrow_default_capture");
+}
+
+export async function setBorrowDefaultCapture(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法修改默认麦克风切换设置");
+  }
+  return invoke<boolean>("set_borrow_default_capture", { enabled });
+}
+
+/** 上次没还原干净时返回当前默认录音设备名，否则返回 null。 */
+export async function checkStaleDefaultCapture(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<string | null>("check_stale_default_capture");
+}
+
+/** 可自动读取语音热键的输入法。微信输入法没有可读配置，不在此列。 */
+export type ImeTool = "sogou" | "doubao";
+
+export const imeToolLabels: Record<ImeTool, string> = {
+  sogou: "搜狗语音输入",
+  doubao: "豆包输入法",
+};
+
+/**
+ * 读取输入法自己配置的按住型语音热键。只读不写；读不到会抛出说明原因的错误，
+ * 不会猜一个默认值。
+ */
+export async function detectImeVoiceHotkey(tool: ImeTool): Promise<VoiceHotkeySettings> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法读取输入法配置");
+  }
+  return invoke<VoiceHotkeySettings>("detect_ime_voice_hotkey", { tool });
+}
+
+/**
+ * 按键映射注入的保持时长（毫秒）：DOWN 与 UP 之间的间隔。零间隔的点按会被
+ * 轮询键盘状态的程序整个丢掉，目标应用漏识别时调高。
+ */
+export async function getInjectionHoldMs(): Promise<number> {
+  if (!isTauriRuntime()) return 30;
+  return invoke<number>("get_injection_hold_ms");
+}
+
+export async function setInjectionHoldMs(millis: number): Promise<number> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法修改按键保持时长");
+  }
+  return invoke<number>("set_injection_hold_ms", { millis });
+}
+
+/** 诊断日志尾部（最近 64 KiB）。浏览器预览返回占位说明。 */
+export async function getDiagnosticLogTail(): Promise<string> {
+  if (!isTauriRuntime()) {
+    return "当前是浏览器预览，没有诊断日志。";
+  }
+  return invoke<string>("get_diagnostic_log_tail");
+}
+
+export async function clearDiagnosticLog(): Promise<void> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，没有诊断日志");
+  }
+  await invoke("clear_diagnostic_log_file");
+}
+
+/** 在文件资源管理器里选中日志文件。日志尚未初始化时返回 false。 */
+export async function revealDiagnosticLog(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  const path = await invoke<string | null>("get_diagnostic_log_path");
+  if (!path) return false;
+  await revealItemInDir(path);
+  return true;
+}
+
+/**
+ * 语音增强（高通 + AGC + 软限幅）。默认关闭；开启后由 AGC 接管电平，
+ * 对下一段语音会话生效，不打断正在进行的会话。
+ */
+export async function getVoiceEnhance(): Promise<boolean> {
+  if (!isTauriRuntime()) return false;
+  return invoke<boolean>("get_voice_enhance");
+}
+
+export async function setVoiceEnhance(enabled: boolean): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法修改语音增强设置");
+  }
+  return invoke<boolean>("set_voice_enhance", { enabled });
+}
+
+/** 按键映射预设方案目录项（list_mapping_presets 返回）。 */
+export interface MappingPresetInfo {
+  id: string;
+  name: string;
+  note: string;
+}
+
+export async function listMappingPresets(): Promise<MappingPresetInfo[]> {
+  if (!isTauriRuntime()) {
+    return [
+      {
+        id: "generic",
+        name: "通用（浏览器 / 任意程序）",
+        note: "上下滚轮、左右切标签页、确定回车、返回 Esc、电源全屏",
+      },
+      {
+        id: "reading",
+        name: "阅读（网页 / 文档）",
+        note: "上下滚轮、确定空格翻页、左右前进后退、主页回到顶部",
+      },
+      {
+        id: "media",
+        name: "影音（播放器 / 视频网站）",
+        note: "确定播放暂停、方向键快退快进、主页全屏、电源静音",
+      },
+    ];
+  }
+  return invoke<MappingPresetInfo[]>("list_mapping_presets");
+}
+
+/** 套用预设方案：整体替换按键映射并持久化，返回保存后的配置。 */
+export async function applyMappingPreset(preset: string): Promise<ButtonMappings> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法套用预设方案");
+  }
+  return invoke<ButtonMappings>("apply_mapping_preset", { preset });
 }
 
 /** 返回 false 表示用户在系统文件选择器中取消。 */
@@ -839,7 +1050,51 @@ export const buttonLabels: Record<RemoteButton, string> = {
   volume_mute: "静音",
   volume_up: "音量+",
   volume_down: "音量−",
+  youtube: "YouTube",
+  netflix: "Netflix",
 };
+
+/**
+ * 机型档案的按键集合（与 Rust 侧 remote_profile 一致）。UI 只显示连接中
+ * 机型实际存在的按键；未识别机型时按小米处理（既有行为）。
+ */
+export const remoteProfileButtons: Record<string, RemoteButton[]> = {
+  xiaomi: [
+    "back",
+    "ok",
+    "tv",
+    "home",
+    "right",
+    "left",
+    "down",
+    "up",
+    "menu",
+    "power",
+    "volume_mute",
+    "volume_up",
+    "volume_down",
+  ],
+  google_tv: [
+    "back",
+    "ok",
+    "tv",
+    "home",
+    "right",
+    "left",
+    "down",
+    "up",
+    "power",
+    "volume_mute",
+    "volume_up",
+    "volume_down",
+    "youtube",
+    "netflix",
+  ],
+};
+
+export function buttonsForProfile(profileId: string | null | undefined): RemoteButton[] {
+  return remoteProfileButtons[profileId ?? "xiaomi"] ?? remoteProfileButtons.xiaomi!;
+}
 
 export function buttonLabel(button: RemoteButton): string {
   return buttonLabels[button];
@@ -927,6 +1182,8 @@ export function shortcutCapability(
     button === "power" ||
     button === "menu" ||
     button === "back" ||
+    button === "youtube" ||
+    button === "netflix" ||
     button === "volume_up" ||
     button === "volume_down"
   ) {
@@ -972,6 +1229,17 @@ const keyLabels: Record<string, string> = {
   f10: "F10",
   f11: "F11",
   f12: "F12",
+  minus: "-",
+  equal: "=",
+  bracket_left: "[",
+  bracket_right: "]",
+  backslash: "\\",
+  semicolon: ";",
+  quote: "'",
+  backtick: "`",
+  comma: ",",
+  period: ".",
+  slash: "/",
 };
 
 export function keyLabel(code: KeyCode): string {
@@ -1056,9 +1324,23 @@ export function registerPresetAppNames(apps: Array<{ id: string; name: string }>
   }
 }
 
+/** 一条序列的摘要：各步用箭头连起来。空序列 = 未设置。 */
+export function sequenceSummary(sequence: readonly ButtonAction[] | undefined): string {
+  // 形状兜底：旧版本写的单动作配置若绕过后端直接到这里，不该让整页渲染崩掉。
+  if (!Array.isArray(sequence) || sequence.length === 0) return "未设置";
+  return sequence.map((action) => actionSummary(action)).join(" → ");
+}
+
 export function actionSummary(action: ButtonAction | undefined): string {
   if (!action || action.type === "disabled") return "未设置";
+  if (action.type === "delay") return `等 ${action.ms}ms`;
   if (action.type === "native") return "原生按键";
+  if (action.type === "mouse") return mouseActionLabels[action.kind];
+  if (action.type === "text") {
+    const preview = action.value.length > 12 ? `${action.value.slice(0, 12)}…` : action.value;
+    return `输入“${preview}”`;
+  }
+  if (action.type === "hold_shortcut") return `按住 ${chordLabel(action.chord)}`;
   if (action.type === "open_app") {
     const known = presetAppNames.get(action.target);
     if (known) return `打开${known}`;

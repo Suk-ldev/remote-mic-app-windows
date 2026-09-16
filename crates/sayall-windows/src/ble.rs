@@ -8,7 +8,9 @@ use crate::{
     send_input_windows::SendInputRuntime,
     ConnectionPhase, ConnectionSnapshot, PlatformError, RemoteModel, UsageCounters,
 };
-use sayall_core::{AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceSessionState};
+use sayall_core::{
+    AtvvCommand, AtvvVoicePipeline, PipelineOutput, VoiceDspSettings, VoiceSessionState,
+};
 use std::future::IntoFuture;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -37,6 +39,8 @@ const AUDIO_UUID: GUID = GUID::from_u128(0xab5e00035a214f05bc7daf01f617b664);
 const CONTROL_UUID: GUID = GUID::from_u128(0xab5e00045a214f05bc7daf01f617b664);
 const DEVICE_INFORMATION_SERVICE_UUID: GUID = GUID::from_u128(0x0000180a00001000800000805f9b34fb);
 const MODEL_NUMBER_UUID: GUID = GUID::from_u128(0x00002a2400001000800000805f9b34fb);
+const BATTERY_SERVICE_UUID: GUID = GUID::from_u128(0x0000180f00001000800000805f9b34fb);
+const BATTERY_LEVEL_UUID: GUID = GUID::from_u128(0x00002a1900001000800000805f9b34fb);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
@@ -60,6 +64,7 @@ impl BleRuntime {
         usage: Arc<UsageCounters>,
         send_input: Arc<SendInputRuntime>,
         voice_hold_hotkey: Arc<Mutex<VoiceHotkeySettings>>,
+        voice_dsp: Arc<Mutex<VoiceDspSettings>>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ConnectionSnapshot::default()));
@@ -76,6 +81,7 @@ impl BleRuntime {
                     usage,
                     send_input,
                     voice_hold_hotkey,
+                    voice_dsp,
                 )
             });
 
@@ -213,6 +219,7 @@ fn worker_loop(
     usage: Arc<UsageCounters>,
     send_input: Arc<SendInputRuntime>,
     voice_hold_hotkey: Arc<Mutex<VoiceHotkeySettings>>,
+    voice_dsp: Arc<Mutex<VoiceDspSettings>>,
 ) {
     if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
         *lock(&state) = failed_snapshot(format!("WinRT 初始化失败：{error}"));
@@ -221,6 +228,7 @@ fn worker_loop(
     let _apartment = WinRtApartment;
     let mut session: Option<BleSession> = None;
     let mut pipeline = AtvvVoicePipeline::default();
+    pipeline.set_dsp_settings(*lock(&voice_dsp));
     let mut active_voice_samples = 0_u64;
     let mut connection_generation = 0_u64;
     let mut capabilities_deadline: Option<Instant> = None;
@@ -603,6 +611,9 @@ fn worker_loop(
                 bytes,
             } => {
                 if message_generation == connection_generation {
+                    // 控制事件只在会话边界到达（开麦/开流/停流），在这里同步
+                    // 语音处理设置：改设置对下一段语音生效，不打断正在流式的会话。
+                    pipeline.set_dsp_settings(*lock(&voice_dsp));
                     handle_control(
                         &mut session,
                         &mut pipeline,
@@ -777,6 +788,7 @@ fn worker_loop(
                     phase: ConnectionPhase::Suspended,
                     remote_name: previous.remote_name,
                     remote_model: previous.remote_model,
+                    battery_level: previous.battery_level,
                     last_error: Some("Windows 已进入睡眠，小米语音遥控器资源已释放".to_owned()),
                     ..ConnectionSnapshot::default()
                 };
@@ -796,6 +808,7 @@ fn worker_loop(
                         phase: ConnectionPhase::Reconnecting,
                         remote_name: previous.remote_name,
                         remote_model: previous.remote_model,
+                        battery_level: previous.battery_level,
                         last_error: Some("Windows 已恢复，正在重新连接小米语音遥控器".to_owned()),
                         ..ConnectionSnapshot::default()
                     };
@@ -876,6 +889,9 @@ fn attempt_connection(
         remote_model: previous
             .as_ref()
             .map_or(RemoteModel::Unknown, |snapshot| snapshot.remote_model),
+        battery_level: previous
+            .as_ref()
+            .and_then(|snapshot| snapshot.battery_level),
         reconnect_attempt,
         ..ConnectionSnapshot::default()
     };
@@ -886,6 +902,7 @@ fn attempt_connection(
         phase: ConnectionPhase::AwaitingCapabilities,
         remote_name: Some(connected.name.clone()),
         remote_model: connected.model,
+        battery_level: connected.battery_level,
         reconnect_attempt,
         ..ConnectionSnapshot::default()
     };
@@ -913,8 +930,10 @@ fn invalidate_connection(
     if let Err(error) = close_session(session) {
         cleanup_errors.push(error.to_string());
     }
+    let dsp_settings = pipeline.dsp_settings();
     pipeline.interrupt();
     *pipeline = AtvvVoicePipeline::default();
+    pipeline.set_dsp_settings(dsp_settings);
     if cleanup_errors.is_empty() {
         Ok(())
     } else {
@@ -1047,6 +1066,13 @@ fn handle_control(
             // 2026-09-04 曾因误接未启动的 voice_key_suppressor 模块导致 F5
             // 泄漏进和弦、微信输入法拒绝触发（evidence/p 复盘）。
             crate::key_suppressor::set_session_active(true);
+            // 临时借用系统默认录音设备（默认关闭）：开启后用户不必进输入法
+            // 设置改麦克风。失败只记日志——语音本身照常工作。
+            if let Some(error) = crate::default_capture::borrow_for_voice() {
+                gatt_note(format!(
+                    "default_capture action=borrow phase=completed terminal_result=failed error_domain=audio_policy error_code=borrow_failed reason={error} retryable=true"
+                ));
+            }
             // F5 解粘保险（2026-09-05 21:08 实证链路）：断连重连场景下
             // 首个 F5 D 在 0x04 之前泄漏进 OS（重连需 ~3s，武装不可能
             // 提前），其 UP 沿若丢失则 OS 键态 F5 永久按下——后续和弦
@@ -1322,6 +1348,14 @@ fn release_voice_hold_hotkey(
 ) {
     crate::key_suppressor::set_session_active(false);
     finish_voice_hotkey(send_input, active_hotkey);
+    // 临时借用的默认录音设备在这里还原。本函数是所有结束路径（正常松手、
+    // 断连、睡眠、退出）的共同出口，所以还原也只需要挂在这一处；没有借用
+    // 时是空操作。
+    if let Err(error) = crate::default_capture::restore() {
+        gatt_note(format!(
+            "default_capture action=restore phase=completed terminal_result=failed error_domain=audio_policy error_code=restore_failed reason={error} retryable=true"
+        ));
+    }
 }
 
 /// 结束边沿单点：任何路径最终都经由这里发出，因此"只发一次且必发一次"
@@ -1383,6 +1417,7 @@ fn close_session(session: &mut Option<BleSession>) -> Result<(), PlatformError> 
 struct BleSession {
     name: String,
     model: RemoteModel,
+    battery_level: Option<u8>,
     device: BluetoothLEDevice,
     service: GattDeviceService,
     transmit: GattCharacteristic,
@@ -1436,6 +1471,16 @@ impl BleSession {
             }
         };
         let name = device.Name().map_err(windows_error)?.to_string();
+        let battery_level = read_battery_level(&device);
+        gatt_note(format!(
+            "battery action=read phase=completed terminal_result={} level={}",
+            if battery_level.is_some() {
+                "passed"
+            } else {
+                "unavailable"
+            },
+            battery_level.map_or("unknown".to_owned(), |level| level.to_string())
+        ));
         let inferred_model = remote_model_from_name(&name);
         let model = if inferred_model == RemoteModel::Unknown {
             read_remote_model(&device).unwrap_or(RemoteModel::Unknown)
@@ -1448,6 +1493,7 @@ impl BleSession {
             crate::key_gate::set_remote_connected(gate_remote_connected(snapshot.phase));
             snapshot.remote_name = Some(name.clone());
             snapshot.remote_model = model;
+            snapshot.battery_level = battery_level;
             snapshot.last_error = None;
         }
         let service = find_service(&device, SERVICE_UUID)?;
@@ -1513,6 +1559,7 @@ impl BleSession {
         let connected = Self {
             name,
             model,
+            battery_level,
             device,
             service,
             transmit,
@@ -1723,6 +1770,54 @@ fn maybe_rotate_diagnostic_log(file: &mut std::fs::File) {
     if file.set_len(0).is_ok() {
         let _ = file.seek(std::io::SeekFrom::Start(0));
     }
+}
+
+/// 诊断日志路径（未初始化返回 None）。日志内容本身绝不打印该路径，
+/// 这里只给界面的"打开所在文件夹"用。
+pub fn diagnostic_log_path() -> Option<std::path::PathBuf> {
+    DIAGNOSTIC_LOG_PATH.get().cloned()
+}
+
+/// 读取日志尾部，最多 `max_bytes` 字节并对齐到行首。日志可达 5 MiB，
+/// 界面只需要最近一段，整份读进内存再传给前端没有必要。
+pub fn read_diagnostic_log_tail(max_bytes: u64) -> Result<String, String> {
+    use std::io::{Read as _, Seek as _};
+    let path = diagnostic_log_path().ok_or_else(|| "诊断日志尚未初始化".to_owned())?;
+    let mut file =
+        std::fs::File::open(&path).map_err(|error| format!("打开诊断日志失败：{error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("读取诊断日志大小失败：{error}"))?
+        .len();
+    let offset = length.saturating_sub(max_bytes);
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|error| format!("定位诊断日志失败：{error}"))?;
+    }
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)
+        .map_err(|error| format!("读取诊断日志失败：{error}"))?;
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    // 截断点可能落在半行中间：丢掉第一行残段。
+    if offset > 0 {
+        if let Some(newline) = text.find('\n') {
+            text = text[newline + 1..].to_owned();
+        }
+    }
+    Ok(text)
+}
+
+/// 清空当前日志文件（`.1` 备份保留）。持写入句柄的锁再截断，避免与正在
+/// 落盘的日志行交错。
+pub fn clear_diagnostic_log() -> Result<(), String> {
+    use std::io::Seek as _;
+    let sink = gatt_sink().ok_or_else(|| "诊断日志尚未初始化".to_owned())?;
+    let mut file = lock(sink);
+    file.set_len(0)
+        .map_err(|error| format!("清空诊断日志失败：{error}"))?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("重置诊断日志写入位置失败：{error}"))?;
+    Ok(())
 }
 
 fn gatt_log(kind: &str, bytes: &[u8]) {
@@ -2102,6 +2197,63 @@ fn read_remote_model(device: &BluetoothLEDevice) -> Option<RemoteModel> {
     let model = read_model_number(&service);
     let _ = service.Close();
     model
+}
+
+/// 标准 GATT 电池服务（0x180F / 0x2A19）：单字节百分比。设备不提供该服务、
+/// 读取失败或返回值越界时返回 None——电量只是信息展示，读不到不影响连接。
+fn read_battery_level(device: &BluetoothLEDevice) -> Option<u8> {
+    let result = block_on(
+        device
+            .GetGattServicesForUuidWithCacheModeAsync(
+                BATTERY_SERVICE_UUID,
+                BluetoothCacheMode::Uncached,
+            )
+            .ok()?,
+    )
+    .ok()?;
+    if result.Status().ok()? != GattCommunicationStatus::Success {
+        return None;
+    }
+    let services = result.Services().ok()?;
+    if services.Size().ok()? == 0 {
+        return None;
+    }
+    let service = services.GetAt(0).ok()?;
+    let level = read_battery_characteristic(&service);
+    let _ = service.Close();
+    level
+}
+
+fn read_battery_characteristic(service: &GattDeviceService) -> Option<u8> {
+    let result = block_on(
+        service
+            .GetCharacteristicsForUuidWithCacheModeAsync(
+                BATTERY_LEVEL_UUID,
+                BluetoothCacheMode::Uncached,
+            )
+            .ok()?,
+    )
+    .ok()?;
+    if result.Status().ok()? != GattCommunicationStatus::Success {
+        return None;
+    }
+    let characteristics = result.Characteristics().ok()?;
+    if characteristics.Size().ok()? == 0 {
+        return None;
+    }
+    let value = block_on(
+        characteristics
+            .GetAt(0)
+            .ok()?
+            .ReadValueWithCacheModeAsync(BluetoothCacheMode::Uncached)
+            .ok()?,
+    )
+    .ok()?;
+    if value.Status().ok()? != GattCommunicationStatus::Success {
+        return None;
+    }
+    let bytes = buffer_to_vec(&value.Value().ok()?).ok()?;
+    bytes.first().copied().filter(|level| *level <= 100)
 }
 
 fn read_model_number(service: &GattDeviceService) -> Option<RemoteModel> {

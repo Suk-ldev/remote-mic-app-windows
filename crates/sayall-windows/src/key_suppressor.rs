@@ -38,7 +38,7 @@
 
 #[cfg(windows)]
 mod windows_impl {
-    use crate::raw_input::device_path_matches_xiaomi_remote;
+    use crate::raw_input::device_path_matches_known_remote;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::OnceLock;
@@ -251,7 +251,7 @@ mod windows_impl {
         let Some(path) = (unsafe { device_name_of(device) }) else {
             return;
         };
-        if device_path_matches_xiaomi_remote(&path) {
+        if device_path_matches_known_remote(&path) {
             ARMED_UNTIL_MS.store(now_ms() + ARM_GRACE_MS, Ordering::Relaxed);
             // 遥控器 HID 活动：通知 BLE 运行时立即重连（断连场景下遥控器
             // 醒来的第一个按键就应触发重试，而不是等退避周期）。

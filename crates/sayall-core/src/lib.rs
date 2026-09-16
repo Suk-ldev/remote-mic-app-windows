@@ -1,5 +1,6 @@
 pub mod adpcm;
 pub mod atvv;
+pub mod dsp;
 pub mod frame;
 pub mod pcm;
 pub mod pipeline;
@@ -9,6 +10,7 @@ pub mod voice;
 
 pub use adpcm::{ImaAdpcmDecoder, NibbleOrder};
 pub use atvv::{AtvvCapabilities, AtvvCommand, AtvvControlEvent, AtvvError, AtvvUuids};
+pub use dsp::{VoiceDsp, VoiceDspSettings};
 pub use frame::FrameAccumulator;
 pub use pcm::process_pcm;
 pub use pipeline::{AtvvVoicePipeline, PipelineError, PipelineOutput};

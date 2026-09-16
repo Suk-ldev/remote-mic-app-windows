@@ -136,9 +136,9 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     enabled: true,
     actions: {
       ok: {
-        single: { type: "shortcut", chord: { keys: ["left_control", "c"] } },
-        double: { type: "disabled" },
-        long: { type: "disabled" },
+        single: [{ type: "shortcut", chord: { keys: ["left_control", "c"] } }],
+        double: [],
+        long: [],
       },
     },
   });

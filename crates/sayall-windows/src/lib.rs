@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 
 pub mod app_launcher;
+pub mod app_profiles;
 #[cfg(windows)]
 mod audio;
 #[cfg(windows)]
@@ -18,16 +19,22 @@ mod bluetooth_radio;
 mod button_gestures;
 pub mod button_mapping;
 pub mod compatibility;
+pub mod default_capture;
 pub mod file_dialog;
 #[cfg(windows)]
-pub use ble::{gatt_note, initialize_diagnostic_log, DiagnosticLogMetadata};
+pub use ble::{
+    clear_diagnostic_log, diagnostic_log_path, gatt_note, initialize_diagnostic_log,
+    read_diagnostic_log_tail, DiagnosticLogMetadata,
+};
 #[cfg(windows)]
 mod ime;
+pub mod ime_hotkey;
 pub mod key_gate;
 #[cfg(windows)]
 mod key_suppressor;
 #[cfg(windows)]
 mod power;
+pub mod presets;
 pub mod raw_input;
 #[cfg(windows)]
 mod raw_input_windows;
@@ -35,6 +42,7 @@ mod raw_input_windows;
 mod rc003_hook;
 #[cfg(any(windows, test))]
 mod reconnect;
+pub mod remote_profile;
 pub mod send_input;
 /// 真实注入运行时（2026-09-06 起 pub：预设注入链路真机验证探针
 /// examples/preset_inject_probe.rs 需复用与映射引擎完全相同的管线）。
@@ -150,6 +158,9 @@ pub struct ConnectionSnapshot {
     pub phase: ConnectionPhase,
     pub remote_name: Option<String>,
     pub remote_model: RemoteModel,
+    /// 遥控器电量百分比（GATT 电池服务 0x180F / 0x2A19）。连接时读一次；
+    /// 设备不提供该服务或读取失败时为 None。
+    pub battery_level: Option<u8>,
     pub capabilities: Option<AtvvCapabilities>,
     pub voice_state: VoiceSessionState,
     pub decoded_samples: u64,
@@ -197,6 +208,7 @@ impl Default for ConnectionSnapshot {
             phase: ConnectionPhase::Idle,
             remote_name: None,
             remote_model: RemoteModel::Unknown,
+            battery_level: None,
             capabilities: None,
             voice_state: VoiceSessionState::Idle,
             decoded_samples: 0,
@@ -212,7 +224,14 @@ impl Default for ConnectionSnapshot {
 pub struct WindowsPlatform {
     usage: Arc<UsageCounters>,
     voice_hold_hotkey: Arc<Mutex<send_input::VoiceHotkeySettings>>,
+    voice_dsp: Arc<Mutex<sayall_core::VoiceDspSettings>>,
     button_mapping: Arc<ButtonMappingRuntime>,
+    /// 用户保存的映射基线。按应用自动切换只做临时覆盖，离开绑定应用后回到这里。
+    mapping_baseline: Arc<std::sync::RwLock<send_input::ButtonMappings>>,
+    app_profiles: Arc<std::sync::RwLock<app_profiles::AppProfileBindings>>,
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    profile_watcher: Arc<app_profiles::watcher::ProfileWatcher>,
     raw_input_snapshot: Arc<Mutex<RawInputSnapshot>>,
     // 抑制器与门控句柄"持有即运行"：字段本身不被读取，随平台生命周期保活
     //（Drop 时停止钩子线程）。
@@ -254,14 +273,43 @@ struct UnsupportedInjector;
 #[cfg(not(windows))]
 impl MappingInjector for UnsupportedInjector {
     fn tap(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
-        Err("SendInput 仅在 Windows 上可用".to_owned())
+        Err(UNSUPPORTED_INJECTION.to_owned())
+    }
+
+    fn launch_app(&self, _target: &str) -> Result<(), String> {
+        Err(UNSUPPORTED_INJECTION.to_owned())
+    }
+
+    fn press(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
+        Err(UNSUPPORTED_INJECTION.to_owned())
+    }
+
+    fn release(&self, _chord: &send_input::KeyChord) -> Result<(), String> {
+        Err(UNSUPPORTED_INJECTION.to_owned())
+    }
+
+    fn mouse(&self, _kind: send_input::MouseAction) -> Result<(), String> {
+        Err(UNSUPPORTED_INJECTION.to_owned())
+    }
+
+    fn text(&self, _value: &str) -> Result<(), String> {
+        Err(UNSUPPORTED_INJECTION.to_owned())
     }
 }
+
+#[cfg(not(windows))]
+const UNSUPPORTED_INJECTION: &str = "SendInput 仅在 Windows 上可用";
 
 impl Default for WindowsPlatform {
     fn default() -> Self {
         let usage = Arc::new(UsageCounters::default());
         let voice_hold_hotkey = Arc::new(Mutex::new(send_input::VoiceHotkeySettings::disabled()));
+        let voice_dsp = Arc::new(Mutex::new(sayall_core::VoiceDspSettings::default()));
+        let mapping_baseline =
+            Arc::new(std::sync::RwLock::new(send_input::ButtonMappings::default()));
+        let app_profiles = Arc::new(std::sync::RwLock::new(
+            app_profiles::AppProfileBindings::default(),
+        ));
         let raw_input_snapshot = Arc::new(Mutex::new(RawInputSnapshot::default()));
         #[cfg(windows)]
         {
@@ -289,6 +337,7 @@ impl Default for WindowsPlatform {
                 Arc::clone(&usage),
                 Arc::clone(&send_input),
                 Arc::clone(&voice_hold_hotkey),
+                Arc::clone(&voice_dsp),
             ));
             let raw_input = Arc::new(raw_input_windows::RawInputRuntime::new(
                 Arc::clone(&raw_input_snapshot),
@@ -305,10 +354,19 @@ impl Default for WindowsPlatform {
                 move || hook_runtime.snapshot(),
                 button_mapping.sender(),
             ));
+            let profile_watcher = Arc::new(app_profiles::watcher::ProfileWatcher::start(
+                Arc::clone(&app_profiles),
+                Arc::clone(&mapping_baseline),
+                Arc::clone(&button_mapping),
+            ));
             Self {
                 usage,
                 voice_hold_hotkey,
+                voice_dsp,
                 button_mapping,
+                mapping_baseline,
+                app_profiles,
+                profile_watcher,
                 raw_input_snapshot,
                 voice_key_suppressor,
                 key_gate,
@@ -333,7 +391,10 @@ impl Default for WindowsPlatform {
             Self {
                 usage,
                 voice_hold_hotkey,
+                voice_dsp,
                 button_mapping,
+                mapping_baseline,
+                app_profiles,
                 raw_input_snapshot,
             }
         }
@@ -351,6 +412,40 @@ impl WindowsPlatform {
 
     pub fn set_voice_hold_hotkey(&self, hotkey: send_input::VoiceHotkeySettings) {
         *lock(&self.voice_hold_hotkey) = hotkey;
+    }
+
+    pub fn injection_hold(&self) -> std::time::Duration {
+        #[cfg(windows)]
+        {
+            self.send_input.injection_hold()
+        }
+
+        #[cfg(not(windows))]
+        {
+            send_input::DEFAULT_INJECTION_HOLD
+        }
+    }
+
+    pub fn set_injection_hold(&self, hold: std::time::Duration) {
+        #[cfg(windows)]
+        {
+            self.send_input.set_injection_hold(hold);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = hold;
+        }
+    }
+
+    pub fn voice_dsp(&self) -> sayall_core::VoiceDspSettings {
+        *lock(&self.voice_dsp)
+    }
+
+    /// 语音处理设置对下一段语音会话生效：正在流式的会话保持当前链路，
+    /// 中途换滤波器会在音频里留下一次跳变。
+    pub fn set_voice_dsp(&self, settings: sayall_core::VoiceDspSettings) {
+        *lock(&self.voice_dsp) = settings.normalized();
     }
 
     pub fn snapshot(&self) -> PlatformSnapshot {
@@ -427,8 +522,36 @@ impl WindowsPlatform {
     }
 
     /// 更新按键映射：持久化由 Tauri 层负责，这里热加载到引擎并同步门控配置。
+    /// 保存用户配置：更新基线并立即生效。按应用自动切换的临时覆盖会在下一次
+    /// 求值时按新基线重算。
     pub fn set_button_mappings(&self, mappings: send_input::ButtonMappings) {
+        *write_lock(&self.mapping_baseline) = mappings.clone();
         self.button_mapping.set_mappings(mappings);
+    }
+
+    pub fn app_profiles(&self) -> app_profiles::AppProfileBindings {
+        read_lock(&self.app_profiles).clone()
+    }
+
+    /// 更新绑定表。绑定变化后立刻回到基线，由监视线程按新表重新决定覆盖层，
+    /// 避免删掉绑定后旧方案还挂着。
+    pub fn set_app_profiles(&self, bindings: app_profiles::AppProfileBindings) {
+        *write_lock(&self.app_profiles) = bindings.normalized();
+        self.button_mapping
+            .set_mappings(read_lock(&self.mapping_baseline).clone());
+    }
+
+    /// 当前由哪个方案接管（界面提示用）。None = 用户自己的配置。
+    pub fn active_app_profile(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            self.profile_watcher.active_profile()
+        }
+
+        #[cfg(not(windows))]
+        {
+            None
+        }
     }
 
     pub fn button_mappings(&self) -> send_input::ButtonMappings {
@@ -633,6 +756,44 @@ impl WindowsPlatform {
             Err(PlatformError::UnsupportedPlatform)
         }
     }
+
+    pub fn test_mouse(
+        &self,
+        kind: send_input::MouseAction,
+    ) -> Result<send_input::SendInputSnapshot, PlatformError> {
+        #[cfg(windows)]
+        {
+            self.send_input.mouse(kind)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = kind;
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+
+    pub fn test_text(&self, value: &str) -> Result<send_input::SendInputSnapshot, PlatformError> {
+        #[cfg(windows)]
+        {
+            self.send_input.text(value)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = value;
+            Err(PlatformError::UnsupportedPlatform)
+        }
+    }
+}
+
+fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

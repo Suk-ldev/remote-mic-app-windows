@@ -1,4 +1,5 @@
 use sayall_core::{AppSettings, ThemePreference, UsageStatistics};
+use sayall_windows::app_profiles::AppProfileBindings;
 use sayall_windows::send_input::{ButtonMappings, KeyChord, VoiceHotkeySettings};
 use std::fs;
 use std::io::ErrorKind;
@@ -63,6 +64,51 @@ impl SettingsStore {
     pub fn save_check_prerelease_updates(&self, enabled: bool) -> Result<(), String> {
         self.update("保存预览版更新设置", move |settings| {
             settings.check_prerelease_updates = enabled;
+        })
+    }
+
+    pub fn save_voice_enhance(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存语音增强设置", |settings| {
+            settings.voice_enhance = enabled;
+        })
+    }
+
+    pub fn load_app_profiles(&self) -> Result<AppProfileBindings, String> {
+        let path = self.app_profiles_path();
+        if !path.exists() {
+            return Ok(AppProfileBindings::default());
+        }
+        let contents =
+            fs::read_to_string(&path).map_err(|error| format!("读取应用方案绑定失败：{error}"))?;
+        serde_json::from_str::<AppProfileBindings>(&contents)
+            .map(AppProfileBindings::normalized)
+            .map_err(|error| format!("解析应用方案绑定失败：{error}"))
+    }
+
+    pub fn save_app_profiles(
+        &self,
+        bindings: AppProfileBindings,
+    ) -> Result<AppProfileBindings, String> {
+        let bindings = bindings.normalized();
+        let path = self.app_profiles_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建应用设置目录失败：{error}"))?;
+        }
+        let contents = serde_json::to_vec_pretty(&bindings)
+            .map_err(|error| format!("序列化应用方案绑定失败：{error}"))?;
+        fs::write(&path, contents).map_err(|error| format!("保存应用方案绑定失败：{error}"))?;
+        Ok(bindings)
+    }
+
+    pub fn save_borrow_default_capture(&self, enabled: bool) -> Result<(), String> {
+        self.update("保存默认麦克风临时切换设置", move |settings| {
+            settings.borrow_default_capture = enabled;
+        })
+    }
+
+    pub fn save_injection_hold_ms(&self, millis: u32) -> Result<(), String> {
+        self.update("保存按键保持时长", move |settings| {
+            settings.injection_hold_ms = millis.min(1_000);
         })
     }
 
@@ -223,6 +269,10 @@ impl SettingsStore {
 
     fn button_mappings_path(&self) -> PathBuf {
         self.path.with_file_name("button-mappings.json")
+    }
+
+    fn app_profiles_path(&self) -> PathBuf {
+        self.path.with_file_name("app-profiles.json")
     }
 
     fn voice_hold_hotkey_path(&self) -> PathBuf {

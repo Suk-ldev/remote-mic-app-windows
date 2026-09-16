@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
+  clearDiagnosticLog,
   formatDiagnosticReport,
+  getDiagnosticLogTail,
   getDiagnosticReport,
+  revealDiagnosticLog,
   type RuntimeSnapshot,
 } from "../lib/bridge";
 
@@ -41,6 +44,43 @@ async function generateDiagnostic() {
     diagnosticMessage.value = error instanceof Error ? error.message : String(error);
   } finally {
     generatingDiagnostic.value = false;
+  }
+}
+
+const logText = ref("");
+const logMessage = ref("尚未读取日志");
+const loadingLog = ref(false);
+
+async function loadLog() {
+  loadingLog.value = true;
+  try {
+    logText.value = await getDiagnosticLogTail();
+    logMessage.value = logText.value.trim()
+      ? "已读取日志末尾（最近 64 KiB）"
+      : "日志为空";
+  } catch (error) {
+    logText.value = "";
+    logMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    loadingLog.value = false;
+  }
+}
+
+async function clearLog() {
+  try {
+    await clearDiagnosticLog();
+    logText.value = "";
+    logMessage.value = "日志已清空";
+  } catch (error) {
+    logMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function revealLog() {
+  try {
+    if (!(await revealDiagnosticLog())) logMessage.value = "日志文件尚未创建";
+  } catch (error) {
+    logMessage.value = error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -102,6 +142,24 @@ async function copyDiagnostic() {
       </div>
       <p class="operation-message" aria-live="polite">{{ diagnosticMessage }}</p>
       <pre v-if="diagnosticText" class="diagnostic-output">{{ diagnosticText }}</pre>
+    </article>
+
+    <article class="card diagnostics-card">
+      <div class="card-title-row">
+        <div>
+          <h2>运行日志</h2>
+          <p class="muted">排障用的技术流水，不含语音内容。单文件上限 5 MiB，超出后自动留一份备份再从头写。</p>
+        </div>
+        <div class="button-row">
+          <button class="secondary-button" type="button" :disabled="loadingLog" @click="loadLog">
+            {{ loadingLog ? "读取中…" : "读取日志" }}
+          </button>
+          <button class="secondary-button" type="button" @click="revealLog">打开所在文件夹</button>
+          <button class="secondary-button" type="button" @click="clearLog">清空日志</button>
+        </div>
+      </div>
+      <p class="operation-message" aria-live="polite">{{ logMessage }}</p>
+      <pre v-if="logText" class="diagnostic-output">{{ logText }}</pre>
     </article>
   </section>
 </template>

@@ -21,10 +21,49 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::raw_input::RemoteButton;
-use crate::send_input::{ButtonAction, ButtonMappings, ButtonTrigger};
+use crate::send_input::{ButtonAction, ButtonMappings, ButtonTrigger, WHEEL_REPEAT_INTERVAL};
 
-/// 双击判定窗口（第二击按下沿之间的最大间隔），Mac 同款。
-pub const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(300);
+/// 双击判定窗口的下限与上限。
+///
+/// 为什么不像 Mac 版那样硬编码 300ms：蓝牙链路上的按键边沿抖动远大于有线
+/// 键盘，硬编码窗口在两个方向都会失败——参考项目 vibe-flow 在真机 RC003 上
+/// 实测，320ms 时一次自然双击的实测间隔是 378ms，被判成两次独立单击；而要求
+/// 用户敲得更快，会快到遥控器根本不上报按下（日志里只有两个释放沿、没有按下
+/// 沿，手势无从形成）。
+///
+/// 因此窗口取用户自己在 Windows 里调好的双击速度（`GetDoubleClickTime`），
+/// 只夹到本项目可用的区间：下限不低于系统默认的 500ms，上限 900ms 以免
+/// 单击的补发延迟长到像卡顿。
+pub const DOUBLE_CLICK_WINDOW_FLOOR: Duration = Duration::from_millis(500);
+pub const DOUBLE_CLICK_WINDOW_CEILING: Duration = Duration::from_millis(900);
+
+/// 把系统双击速度夹到可用区间。非 Windows 主机取不到系统值，用下限。
+pub fn clamp_double_click_window(system: Duration) -> Duration {
+    system.clamp(DOUBLE_CLICK_WINDOW_FLOOR, DOUBLE_CLICK_WINDOW_CEILING)
+}
+
+/// 读一次系统双击速度（毫秒）。读不到返回 None，由调用方回落到下限。
+#[cfg(windows)]
+fn system_double_click_millis() -> Option<u64> {
+    // GetDoubleClickTime 不会失败，但返回 0 表示状态异常，按读不到处理。
+    let value = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    (value > 0).then_some(u64::from(value))
+}
+
+#[cfg(not(windows))]
+fn system_double_click_millis() -> Option<u64> {
+    None
+}
+
+/// 进程内的双击判定窗口：首次使用时读一次系统值并缓存。用户改系统双击速度
+/// 后需要重启应用才生效——这是刻意的，避免手势识别的判定标准在运行中漂移。
+pub fn double_click_window() -> Duration {
+    static WINDOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| match system_double_click_millis() {
+        Some(millis) => clamp_double_click_window(Duration::from_millis(millis)),
+        None => DOUBLE_CLICK_WINDOW_FLOOR,
+    })
+}
 /// 长按阈值（按住多久触发长按），Mac 同款。
 pub const LONG_PRESS_THRESHOLD: Duration = Duration::from_millis(550);
 /// 连发起始延迟（按住多久开始重复单击），Mac 同款。
@@ -51,11 +90,25 @@ impl GestureConfig {
         if !mappings.enabled || !actions.any_configured() {
             return None;
         }
-        let single_configured = actions.single != ButtonAction::Disabled;
-        let double_enabled = actions.double != ButtonAction::Disabled;
-        let long_enabled = actions.long != ButtonAction::Disabled;
+        // 按住快捷键走按下/松开边沿（button_mapping 的 hold 路径），不参与
+        // 手势识别；归一化保证它只单独占据单击列且无双击/长按。
+        if matches!(
+            actions.single.as_slice(),
+            [ButtonAction::HoldShortcut { .. }]
+        ) {
+            return None;
+        }
+        let single_configured = !actions.single.is_empty();
+        let double_enabled = !actions.double.is_empty();
+        let long_enabled = !actions.long.is_empty();
         let repeat = if single_configured && !double_enabled && !long_enabled {
-            button.repeat_interval()
+            // 滚轮的连滚由动作决定而非按键：挂在哪个键上都按住连滚。
+            // 多步序列不连发——连发一串带等待的动作没有可用语义。
+            match actions.single.as_slice() {
+                [ButtonAction::Mouse { kind }] if kind.is_wheel() => Some(WHEEL_REPEAT_INTERVAL),
+                [_] => button.repeat_interval(),
+                _ => None,
+            }
         } else {
             None
         };
@@ -86,14 +139,36 @@ struct ButtonGestureState {
 }
 
 /// 手势识别器：每键独立状态机。所有方法都不会 panic，未配置的按键被忽略。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GestureRecognizer {
     buttons: BTreeMap<RemoteButton, (GestureConfig, ButtonGestureState)>,
+    double_click_window: Duration,
+}
+
+impl Default for GestureRecognizer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GestureRecognizer {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            buttons: BTreeMap::new(),
+            double_click_window: double_click_window(),
+        }
+    }
+
+    /// 指定双击窗口构造（测试用；生产走 [`GestureRecognizer::new`]）。
+    pub fn with_double_click_window(window: Duration) -> Self {
+        Self {
+            buttons: BTreeMap::new(),
+            double_click_window: clamp_double_click_window(window),
+        }
+    }
+
+    pub fn double_click_window(&self) -> Duration {
+        self.double_click_window
     }
 
     /// 按当前映射重建配置。配置变化会重置全部手势状态（进行中的双击窗口、
@@ -153,7 +228,7 @@ impl GestureRecognizer {
         }
         if config.double_enabled {
             state.waiting_for_second = true;
-            state.double_deadline = Some(now + DOUBLE_CLICK_WINDOW);
+            state.double_deadline = Some(now + self.double_click_window);
             return Vec::new();
         }
         if config.raw_path() {
@@ -233,7 +308,10 @@ impl GestureRecognizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode};
+    use crate::send_input::{ButtonAction, ButtonActions, KeyChord, KeyCode, MouseAction};
+
+    /// 测试用的固定双击窗口：生产值跟随系统双击速度，断言不能依赖它。
+    const TEST_DOUBLE_WINDOW: Duration = DOUBLE_CLICK_WINDOW_FLOOR;
 
     fn mappings_with(
         button: RemoteButton,
@@ -242,10 +320,10 @@ mod tests {
         long: Option<KeyCode>,
     ) -> ButtonMappings {
         let action = |keys: Option<KeyCode>| match keys {
-            Some(key) => ButtonAction::Shortcut {
+            Some(key) => vec![ButtonAction::Shortcut {
                 chord: KeyChord { keys: vec![key] },
-            },
-            None => ButtonAction::Disabled,
+            }],
+            None => Vec::new(),
         };
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
@@ -259,10 +337,120 @@ mod tests {
         mappings
     }
 
+    fn mappings_with_single(button: RemoteButton, single: ButtonAction) -> ButtonMappings {
+        let mut mappings = ButtonMappings::default();
+        mappings
+            .actions
+            .insert(button, ButtonActions::single(single));
+        mappings
+    }
+
+    #[test]
+    fn double_click_window_follows_the_system_setting_within_bounds() {
+        // 低于下限的系统设置被抬到下限：蓝牙边沿抖动下 320ms 会把自然双击
+        // （实测 378ms）判成两次单击。
+        assert_eq!(
+            clamp_double_click_window(Duration::from_millis(320)),
+            DOUBLE_CLICK_WINDOW_FLOOR
+        );
+        // 区间内原样采用用户自己的设置。
+        assert_eq!(
+            clamp_double_click_window(Duration::from_millis(700)),
+            Duration::from_millis(700)
+        );
+        // 高于上限被压到上限：单击的补发延迟不能长到像卡顿。
+        assert_eq!(
+            clamp_double_click_window(Duration::from_millis(5_000)),
+            DOUBLE_CLICK_WINDOW_CEILING
+        );
+        // 进程内的实际取值始终落在区间内。
+        let window = double_click_window();
+        assert!(window >= DOUBLE_CLICK_WINDOW_FLOOR && window <= DOUBLE_CLICK_WINDOW_CEILING);
+        assert_eq!(GestureRecognizer::new().double_click_window(), window);
+    }
+
+    /// 参考项目 vibe-flow 在真机 RC003 上实测的失败场景：两击相隔 378ms。
+    #[test]
+    fn a_natural_bluetooth_double_tap_at_378ms_is_recognized() {
+        let t0 = Instant::now();
+        let mut recognizer = GestureRecognizer::with_double_click_window(DOUBLE_CLICK_WINDOW_FLOOR);
+        recognizer.configure(&mappings_with(
+            RemoteButton::Ok,
+            Some(KeyCode::Enter),
+            Some(KeyCode::Escape),
+            None,
+        ));
+
+        assert!(recognizer.press(RemoteButton::Ok, t0).is_empty());
+        assert!(recognizer
+            .release(RemoteButton::Ok, t0 + Duration::from_millis(40))
+            .is_empty());
+        // 第二击落在 378ms：旧的 300ms 窗口会先超时补发单击。
+        let second = t0 + Duration::from_millis(378);
+        assert!(
+            recognizer.advance(second).is_empty(),
+            "378ms 时双击窗口不应已超时"
+        );
+        assert!(recognizer.press(RemoteButton::Ok, second).is_empty());
+        assert_eq!(
+            recognizer.release(RemoteButton::Ok, second + Duration::from_millis(40)),
+            vec![ButtonTrigger::Double]
+        );
+    }
+
+    #[test]
+    fn wheel_repeats_even_on_buttons_without_a_native_repeat_interval() {
+        // 确定键本身不连发（repeat_interval = None），但滚轮动作应连滚。
+        assert_eq!(RemoteButton::Ok.repeat_interval(), None);
+        let config = GestureConfig::for_button(
+            &mappings_with_single(
+                RemoteButton::Ok,
+                ButtonAction::Mouse {
+                    kind: MouseAction::WheelDown,
+                },
+            ),
+            RemoteButton::Ok,
+        )
+        .unwrap();
+        assert_eq!(config.repeat, Some(WHEEL_REPEAT_INTERVAL));
+
+        // 鼠标左键不是滚轮：沿用按键自身的连发能力（确定键为不连发）。
+        let config = GestureConfig::for_button(
+            &mappings_with_single(
+                RemoteButton::Ok,
+                ButtonAction::Mouse {
+                    kind: MouseAction::LeftClick,
+                },
+            ),
+            RemoteButton::Ok,
+        )
+        .unwrap();
+        assert_eq!(config.repeat, None);
+    }
+
+    #[test]
+    fn hold_shortcut_is_not_a_gesture() {
+        let mappings = mappings_with_single(
+            RemoteButton::Ok,
+            ButtonAction::HoldShortcut {
+                chord: KeyChord {
+                    keys: vec![KeyCode::Space],
+                },
+            },
+        );
+        assert!(GestureConfig::for_button(&mappings, RemoteButton::Ok).is_none());
+
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
+        recognizer.configure(&mappings);
+        let now = Instant::now();
+        assert!(recognizer.press(RemoteButton::Ok, now).is_empty());
+        assert!(recognizer.release(RemoteButton::Ok, now).is_empty());
+    }
+
     #[test]
     fn raw_single_path_fires_on_press_and_repeats_while_held() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Up,
             Some(KeyCode::Up),
@@ -306,15 +494,12 @@ mod tests {
         ] {
             mappings.actions.insert(
                 button,
-                ButtonActions {
-                    single: ButtonAction::Shortcut {
-                        chord: KeyChord { keys: vec![key] },
-                    },
-                    ..ButtonActions::default()
-                },
+                ButtonActions::single(ButtonAction::Shortcut {
+                    chord: KeyChord { keys: vec![key] },
+                }),
             );
         }
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings);
 
         assert_eq!(
@@ -334,7 +519,7 @@ mod tests {
     #[test]
     fn long_press_only_config_fires_single_on_release_and_long_at_threshold() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Menu,
             Some(KeyCode::Enter),
@@ -370,7 +555,7 @@ mod tests {
     #[test]
     fn double_click_window_defers_single_and_second_release_fires_double() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Ok,
             Some(KeyCode::Enter),
@@ -401,7 +586,7 @@ mod tests {
             vec![]
         );
         assert_eq!(
-            recognizer.advance(t2 + Duration::from_millis(50) + DOUBLE_CLICK_WINDOW),
+            recognizer.advance(t2 + Duration::from_millis(50) + TEST_DOUBLE_WINDOW),
             vec![(RemoteButton::Ok, ButtonTrigger::Single)]
         );
     }
@@ -409,7 +594,7 @@ mod tests {
     #[test]
     fn second_press_hold_can_still_trigger_long_press() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Home,
             Some(KeyCode::Enter),
@@ -438,7 +623,7 @@ mod tests {
     #[test]
     fn configuring_double_or_long_disables_repeat() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Up,
             Some(KeyCode::Up),
@@ -452,7 +637,7 @@ mod tests {
             vec![]
         );
         assert_eq!(
-            recognizer.advance(t0 + Duration::from_millis(50) + DOUBLE_CLICK_WINDOW),
+            recognizer.advance(t0 + Duration::from_millis(50) + TEST_DOUBLE_WINDOW),
             vec![(RemoteButton::Up, ButtonTrigger::Single)]
         );
         assert_eq!(
@@ -465,7 +650,7 @@ mod tests {
     #[test]
     fn release_all_cancels_pending_windows_and_repeat_without_firing() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings_with(
             RemoteButton::Back,
             Some(KeyCode::Escape),
@@ -485,7 +670,7 @@ mod tests {
     #[test]
     fn unconfigured_and_disabled_buttons_are_ignored() {
         let t0 = Instant::now();
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&ButtonMappings::default());
         assert_eq!(recognizer.press(RemoteButton::Ok, t0), vec![]);
         assert_eq!(recognizer.release(RemoteButton::Ok, t0), vec![]);
@@ -505,7 +690,7 @@ mod tests {
     fn enabled_toggle_off_disables_everything() {
         let t0 = Instant::now();
         let mut mappings = mappings_with(RemoteButton::Up, Some(KeyCode::Up), None, None);
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings);
         mappings.enabled = false;
         recognizer.configure(&mappings);
@@ -520,28 +705,28 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Down,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Down],
                     },
-                },
-                double: ButtonAction::Shortcut {
+                }],
+                double: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Space],
                     },
-                },
-                long: ButtonAction::Disabled,
+                }],
+                long: Vec::new(),
             },
         );
-        let mut recognizer = GestureRecognizer::new();
+        let mut recognizer = GestureRecognizer::with_double_click_window(TEST_DOUBLE_WINDOW);
         recognizer.configure(&mappings);
         recognizer.press(RemoteButton::Up, t0);
         recognizer.press(RemoteButton::Down, t0);
         recognizer.release(RemoteButton::Down, t0 + Duration::from_millis(30));
-        // Up 连发起始 = t0+350ms；Down 双击窗口 = t0+30+300ms = t0+330ms（更早）。
-        assert_eq!(
-            recognizer.next_deadline(),
-            Some(t0 + Duration::from_millis(330))
-        );
+        // Up 连发起始 = t0 + REPEAT_START_DELAY；Down 双击窗口 = t0+30ms + 窗口。
+        // 断言取两者较早的一个——双击窗口跟随系统设置，不能写死数值。
+        let up_repeat = t0 + REPEAT_START_DELAY;
+        let down_double = t0 + Duration::from_millis(30) + TEST_DOUBLE_WINDOW;
+        assert_eq!(recognizer.next_deadline(), Some(up_repeat.min(down_double)));
     }
 }

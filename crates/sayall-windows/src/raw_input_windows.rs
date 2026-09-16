@@ -1,8 +1,8 @@
 use crate::button_mapping::EngineMessage;
 use crate::key_gate;
 use crate::raw_input::{
-    button_for_usage, decode_report_usages, normalize_device_path, parse_raw_hid_body,
-    select_single_device_path, RawInputPhase, RawInputSnapshot, RawKeyboardEvent,
+    decode_report_usages, normalize_device_path, parse_raw_hid_body, select_single_device_path,
+    RawInputPhase, RawInputSnapshot, RawKeyboardEvent,
 };
 use crate::PlatformError;
 use std::cell::RefCell;
@@ -216,6 +216,7 @@ fn wait_for_thread(control: &mut ListenerControl, timeout: Duration) -> bool {
 
 struct ListenerContext {
     selected_path: String,
+    profile: &'static crate::remote_profile::RemoteProfile,
     snapshot: Arc<Mutex<RawInputSnapshot>>,
     engine: Sender<EngineMessage>,
 }
@@ -276,9 +277,19 @@ fn run_listener(
         snapshot.matched_device_count = paths.len() as u32;
     }
     let selected_path = select_single_device_path(&paths).map_err(|error| error.to_string())?;
+    // 机型档案决定 HID usage 怎么解：小米用键盘页、Google TV 用消费者页，
+    // 同一个 usage 在两页含义不同（见 remote_profile 模块文档）。
+    let profile = crate::remote_profile::profile_for_device_path(&selected_path)
+        .unwrap_or(crate::remote_profile::DEFAULT_PROFILE);
+    {
+        let mut snapshot = snapshot.lock().unwrap();
+        snapshot.profile_id = Some(profile.id.to_owned());
+    }
+    let _ = engine.send(EngineMessage::ProfileChanged(profile));
     THREAD_CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ListenerContext {
             selected_path: normalize_device_path(&selected_path),
+            profile,
             snapshot: Arc::clone(&snapshot),
             engine,
         });
@@ -514,7 +525,7 @@ fn handle_raw_input(handle: HRAWINPUT) -> Result<(), String> {
                 // HID 报文（独立管线，不受键盘 LL 钩子影响）到达即武装
                 // 对应按键：其键盘孪生事件在钩子里据此归因吞键。
                 for usage in &usages {
-                    if let Some(button) = button_for_usage(*usage) {
+                    if let Some(button) = context.profile.button_for_usage(*usage) {
                         key_gate::arm_button(button, GATE_ARM_GRACE_MS);
                     }
                 }
@@ -548,7 +559,7 @@ fn enumerate_matching_device_paths() -> Result<Vec<String>, String> {
             continue;
         }
         if let Ok(path) = get_device_name(device.hDevice) {
-            if crate::raw_input::device_path_matches_xiaomi_remote(&path) {
+            if crate::raw_input::device_path_matches_known_remote(&path) {
                 paths.push(path);
             }
         }

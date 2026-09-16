@@ -11,6 +11,15 @@ const emit = defineEmits<{ select: [page: PageId] }>();
  * info.circle）。Windows 无 SF Symbols，用同形 SVG 还原。
  */
 const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
+  checklist: {
+    // SF "checklist"：两条对勾 + 两条列表线
+    strokes: [
+      "M3.4 7.4l1.7 1.7 3-3.2",
+      "M3.4 15.6l1.7 1.7 3-3.2",
+      "M11.6 7.4h9",
+      "M11.6 16.4h9",
+    ],
+  },
   keyboard: {
     // SF "keyboard"：圆角键盘轮廓 + 功能行点阵 + 底部长条
     strokes: [

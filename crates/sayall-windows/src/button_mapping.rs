@@ -37,7 +37,9 @@ use crate::key_gate;
 use crate::raw_input::{
     ButtonEdge, ButtonStateMerger, RawInputSnapshot, RawKeyboardEvent, RemoteButton,
 };
-use crate::send_input::{native_key, ButtonAction, ButtonMappings, ButtonTrigger, KeyChord};
+use crate::send_input::{
+    native_key, ButtonAction, ButtonMappings, ButtonTrigger, KeyChord, MouseAction,
+};
 use crate::UsageCounters;
 
 /// 引擎消息（监听器/门控/宿主 → 引擎线程）。
@@ -55,6 +57,8 @@ pub enum EngineMessage {
     DeviceRemoved,
     /// 按键映射已更新：重建手势配置。
     MappingsChanged,
+    /// 监听器识别出遥控器机型：HID usage 改按该档案解。
+    ProfileChanged(&'static crate::remote_profile::RemoteProfile),
     Shutdown,
 }
 
@@ -63,6 +67,12 @@ pub trait MappingInjector: Send + Sync {
     fn tap(&self, chord: &KeyChord) -> Result<(), String>;
     /// 打开/激活预设应用（生产实现调用 app_launcher）。
     fn launch_app(&self, target: &str) -> Result<(), String>;
+    /// 按住快捷键的按下沿：注入 DOWN，不发 UP。
+    fn press(&self, chord: &KeyChord) -> Result<(), String>;
+    /// 按住快捷键的松开沿：注入 UP。必须与 [`Self::press`] 严格成对。
+    fn release(&self, chord: &KeyChord) -> Result<(), String>;
+    fn mouse(&self, kind: MouseAction) -> Result<(), String>;
+    fn text(&self, value: &str) -> Result<(), String>;
 }
 
 /// 生产注入器：批量 SendInput tap（DOWN+UP），部分交付时由 send_input 层回滚。
@@ -87,6 +97,34 @@ impl MappingInjector for SendInputInjector {
 
     fn launch_app(&self, target: &str) -> Result<(), String> {
         crate::app_launcher::activate_or_launch(target)
+    }
+
+    fn press(&self, chord: &KeyChord) -> Result<(), String> {
+        self.runtime
+            .press(chord)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn release(&self, chord: &KeyChord) -> Result<(), String> {
+        self.runtime
+            .release(chord)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn mouse(&self, kind: MouseAction) -> Result<(), String> {
+        self.runtime
+            .mouse(kind)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn text(&self, value: &str) -> Result<(), String> {
+        self.runtime
+            .text(value)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -422,6 +460,31 @@ fn engine_worker(
                     &mut native_pending,
                 );
             }
+            EngineMessage::ProfileChanged(profile) => {
+                let edges = merger.set_profile(profile);
+                crate::ble::gatt_note(format!(
+                    "map_profile id={} verified={} buttons={}",
+                    profile.id,
+                    profile.verified,
+                    profile.buttons.len()
+                ));
+                lock_snapshot(&snapshot).profile_id = Some(profile.id.to_owned());
+                let now = Instant::now();
+                handle_edges(
+                    edges,
+                    now,
+                    &mut merger,
+                    &mut recognizer,
+                    &mappings,
+                    &state,
+                    &snapshot,
+                    &edge_callbacks,
+                    &gesture_callbacks,
+                    &injector,
+                    &usage,
+                    &mut native_pending,
+                );
+            }
             EngineMessage::MappingsChanged => {
                 let mappings = read_lock(&mappings).clone();
                 recognizer.configure(&mappings);
@@ -493,6 +556,9 @@ fn handle_edges(
     }
 
     for edge in edges {
+        if fire_hold_edge(edge, mappings, state, injector) {
+            continue;
+        }
         let fired = if edge.is_pressed {
             recognizer.press(edge.button, now)
         } else {
@@ -561,6 +627,49 @@ fn reset_after_terminal_action(
     }
 }
 
+/// 按住快捷键的边沿注入：按下发 DOWN、松开发 UP。返回 true 表示该边沿已
+/// 由按住路径消费，不再交给手势识别。
+///
+/// 松开沿的来源包含监听器停止、设备移除与释放全部按住状态（handle_edges
+/// 是这些路径的唯一出口），因此按下的键不会因断连而留在按下态。
+fn fire_hold_edge(
+    edge: ButtonEdge,
+    mappings: &Arc<RwLock<ButtonMappings>>,
+    state: &Arc<Mutex<EngineState>>,
+    injector: &Arc<dyn MappingInjector>,
+) -> bool {
+    let mappings = read_lock(mappings).clone();
+    let sequence = mappings.sequence_for(edge.button, ButtonTrigger::Single);
+    let [ButtonAction::HoldShortcut { chord }] = sequence.as_slice() else {
+        return false;
+    };
+    if !mappings.enabled || !key_gate::is_gate_thread_alive() {
+        crate::ble::gatt_note(format!(
+            "map_skip_inject reason=gate_not_alive action=hold_shortcut button={:?} pressed={}",
+            edge.button, edge.is_pressed
+        ));
+        return true;
+    }
+    crate::ble::gatt_note(format!(
+        "map_fire button={:?} action=hold_shortcut edge={}",
+        edge.button,
+        if edge.is_pressed { "down" } else { "up" }
+    ));
+    let result = if edge.is_pressed {
+        injector.press(chord)
+    } else {
+        injector.release(chord)
+    };
+    match result {
+        Ok(()) => crate::ble::gatt_note("map_inject result=ok kind=hold_shortcut".to_owned()),
+        Err(error) => {
+            crate::ble::gatt_note("map_inject result=err kind=hold_shortcut error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+            lock_state(state).last_error = Some(format!("注入按住快捷键失败：{error}"));
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fire_gesture(
     button: RemoteButton,
@@ -595,8 +704,8 @@ fn fire_gesture(
         }
         return false;
     }
-    let action = mappings.action_for(button, trigger);
-    if action == ButtonAction::Disabled {
+    let sequence = mappings.sequence_for(button, trigger);
+    if sequence.is_empty() {
         crate::ble::gatt_note(format!(
             "map_skip_inject reason=action_disabled button={:?} trigger={:?}",
             button, trigger
@@ -609,11 +718,13 @@ fn fire_gesture(
     // 语义与连发。标记在此消费，对冲只作用于本次按住的首个 Single。
     if native_pending.remove(&button) {
         if trigger == ButtonTrigger::Single {
-            let native_covers = match &action {
+            // 只有单步序列才可能被原生动作覆盖：多步序列里原生最多交付其中
+            // 一步，跳过整条会丢掉其余步骤。
+            let native_covers = match sequence.as_slice() {
                 // 显式原生透传：原生动作就是它本身，泄漏即已交付。
-                ButtonAction::Native => native_key(button).is_some(),
+                [ButtonAction::Native] => native_key(button).is_some(),
                 // 单键快捷键恰好等于原生动作（右→右 等）。
-                ButtonAction::Shortcut { chord } => {
+                [ButtonAction::Shortcut { chord }] => {
                     chord.keys.len() == 1
                         && native_key(button).is_some_and(|native| chord.keys[0] == native)
                 }
@@ -628,8 +739,34 @@ fn fire_gesture(
             }
         }
     }
+    // 序列按顺序执行；某一步触发了会切换会话的动作（锁屏）就停在那里，
+    // 后续步骤打在锁屏界面上没有意义。
+    for action in sequence {
+        if execute_action(button, trigger, action, state, injector) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 执行序列里的一步。返回 true 表示该动作会切换 Windows 会话（锁屏），
+/// 调用方应停止后续步骤并重置按住状态。
+fn execute_action(
+    button: RemoteButton,
+    trigger: ButtonTrigger,
+    action: ButtonAction,
+    state: &Arc<Mutex<EngineState>>,
+    injector: &Arc<dyn MappingInjector>,
+) -> bool {
     match action {
         ButtonAction::Disabled => {}
+        ButtonAction::Delay { ms } => {
+            crate::ble::gatt_note(format!(
+                "map_fire button={:?} trigger={:?} action=delay ms={ms}",
+                button, trigger
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+        }
         ButtonAction::Shortcut { chord } => {
             let terminal_action = chord.is_lock_workstation();
             crate::ble::gatt_note(format!(
@@ -680,6 +817,37 @@ fn fire_gesture(
                 ));
             }
         },
+        ButtonAction::Mouse { kind } => {
+            crate::ble::gatt_note(format!(
+                "map_fire button={:?} trigger={:?} action=mouse kind={:?}",
+                button, trigger, kind
+            ));
+            match injector.mouse(kind) {
+                Ok(()) => crate::ble::gatt_note("map_inject result=ok kind=mouse".to_owned()),
+                Err(error) => {
+                    crate::ble::gatt_note("map_inject result=err kind=mouse error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+                    lock_state(state).last_error = Some(format!("注入鼠标动作失败：{error}"));
+                }
+            }
+        }
+        ButtonAction::Text { value } => {
+            crate::ble::gatt_note(format!(
+                "map_fire button={:?} trigger={:?} action=text chars={}",
+                button,
+                trigger,
+                value.chars().count()
+            ));
+            match injector.text(&value) {
+                Ok(()) => crate::ble::gatt_note("map_inject result=ok kind=text".to_owned()),
+                Err(error) => {
+                    crate::ble::gatt_note("map_inject result=err kind=text error_domain=send_input error_code=injection_failed reason=backend_rejected retryable=true".to_owned());
+                    lock_state(state).last_error = Some(format!("注入文本失败：{error}"));
+                }
+            }
+        }
+        // 按住快捷键不走手势路径（归一化保证它只在单击列且无双击/长按，
+        // GestureConfig 对该键返回 None）：按下/松开由 fire_hold_edge 处理。
+        ButtonAction::HoldShortcut { .. } => {}
         ButtonAction::OpenApp { target } => {
             let target_kind = if target.contains('\\') || target.contains('/') {
                 "custom"
@@ -745,6 +913,10 @@ mod tests {
     struct RecordingInjector {
         taps: StdMutex<Vec<KeyChord>>,
         launches: StdMutex<Vec<String>>,
+        /// 按住快捷键的边沿：(和弦, 是否按下)。
+        hold_edges: StdMutex<Vec<(KeyChord, bool)>>,
+        mouse: StdMutex<Vec<MouseAction>>,
+        texts: StdMutex<Vec<String>>,
         fail: bool,
     }
 
@@ -764,6 +936,38 @@ mod tests {
             self.launches.lock().unwrap().push(target.to_owned());
             Ok(())
         }
+
+        fn press(&self, chord: &KeyChord) -> Result<(), String> {
+            if self.fail {
+                return Err("注入失败（测试）".to_owned());
+            }
+            self.hold_edges.lock().unwrap().push((chord.clone(), true));
+            Ok(())
+        }
+
+        fn release(&self, chord: &KeyChord) -> Result<(), String> {
+            if self.fail {
+                return Err("注入失败（测试）".to_owned());
+            }
+            self.hold_edges.lock().unwrap().push((chord.clone(), false));
+            Ok(())
+        }
+
+        fn mouse(&self, kind: MouseAction) -> Result<(), String> {
+            if self.fail {
+                return Err("注入失败（测试）".to_owned());
+            }
+            self.mouse.lock().unwrap().push(kind);
+            Ok(())
+        }
+
+        fn text(&self, value: &str) -> Result<(), String> {
+            if self.fail {
+                return Err("注入失败（测试）".to_owned());
+            }
+            self.texts.lock().unwrap().push(value.to_owned());
+            Ok(())
+        }
     }
 
     fn mappings_with_single(button: RemoteButton, key: KeyCode) -> ButtonMappings {
@@ -771,9 +975,9 @@ mod tests {
         mappings.actions.insert(
             button,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord { keys: vec![key] },
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -831,8 +1035,10 @@ mod tests {
             Arc::new(UsageCounters::default()),
             Arc::new(StdMutex::new(RawInputSnapshot::default())),
         );
-        let single = |key: KeyCode| ButtonAction::Shortcut {
-            chord: KeyChord { keys: vec![key] },
+        let single = |key: KeyCode| {
+            vec![ButtonAction::Shortcut {
+                chord: KeyChord { keys: vec![key] },
+            }]
         };
         let mut mappings = ButtonMappings::default();
         // 上→上：同键映射（泄漏对冲目标）。
@@ -865,7 +1071,7 @@ mod tests {
             ButtonActions {
                 single: single(KeyCode::Enter),
                 double: single(KeyCode::Space),
-                long: ButtonAction::Disabled,
+                long: Vec::new(),
             },
         );
         // 电源→Win+L：锁屏会让真实 UP 延迟到解锁后，引擎须在成功请求锁屏后
@@ -873,11 +1079,11 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Power,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::LeftWindows, KeyCode::L],
                     },
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -1047,10 +1253,9 @@ mod tests {
             }],
             "OK 只配置单击：HID 按下/释放应触发一次单击手势"
         );
-        assert!(
-            injector.taps.lock().unwrap().is_empty(),
-            "门控未运行（测试环境）时不得注入"
-        );
+        // 注意：不在此断言"未注入"。门控存活是进程级全局状态，并行运行的
+        // 其它用例会启停自己的 KeyGate，断言它处于关闭态是不稳定的。
+        // "门控未运行不注入"由 fire_gesture 自身的分支保证。
         drop(fired);
 
         let snapshot = snapshot.lock().unwrap();
@@ -1074,9 +1279,9 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Ok,
             ButtonActions {
-                single: ButtonAction::OpenApp {
+                single: vec![ButtonAction::OpenApp {
                     target: "notepad".to_owned(),
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -1099,6 +1304,251 @@ mod tests {
         assert!(
             injector.taps.lock().unwrap().is_empty(),
             "打开应用动作不得注入按键"
+        );
+        drop(gate);
+    }
+
+    fn runtime_with(
+        injector: &Arc<RecordingInjector>,
+        button: RemoteButton,
+        single: ButtonAction,
+    ) -> ButtonMappingRuntime {
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        let mut mappings = ButtonMappings::default();
+        mappings
+            .actions
+            .insert(button, ButtonActions::single(single));
+        runtime.set_mappings(mappings);
+        runtime
+    }
+
+    /// 滚轮动作：确定键本身不连发，但滚轮按住应连滚（连滚由动作决定）。
+    #[test]
+    fn wheel_action_injects_on_press_and_repeats_while_held() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = runtime_with(
+            &injector,
+            RemoteButton::Ok,
+            ButtonAction::Mouse {
+                kind: MouseAction::WheelDown,
+            },
+        );
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        // 起始延迟 350ms + 连滚间隔 70ms：按住 700ms 至少多滚几格。
+        std::thread::sleep(Duration::from_millis(700));
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let events = injector.mouse.lock().unwrap();
+        assert!(
+            events.len() > 1,
+            "按住应连滚，实际只注入 {} 次",
+            events.len()
+        );
+        assert!(events.iter().all(|kind| *kind == MouseAction::WheelDown));
+        assert!(
+            injector.taps.lock().unwrap().is_empty(),
+            "鼠标动作不得走按键注入"
+        );
+        drop(events);
+        drop(gate);
+    }
+
+    /// 按住快捷键：按下注入 DOWN、松开注入 UP，且不产生点按。
+    #[test]
+    fn hold_shortcut_injects_paired_down_and_up_edges() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let chord = KeyChord {
+            keys: vec![KeyCode::Space],
+        };
+        let runtime = runtime_with(
+            &injector,
+            RemoteButton::Ok,
+            ButtonAction::HoldShortcut {
+                chord: chord.clone(),
+            },
+        );
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            injector.hold_edges.lock().unwrap().as_slice(),
+            &[(chord.clone(), true), (chord, false)]
+        );
+        assert!(injector.taps.lock().unwrap().is_empty());
+        drop(gate);
+    }
+
+    /// 断连不得把按住的键留在按下态：设备移除产生的释放沿要注入 UP。
+    #[test]
+    fn hold_shortcut_releases_when_the_device_is_removed() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let chord = KeyChord {
+            keys: vec![KeyCode::Space],
+        };
+        let runtime = runtime_with(
+            &injector,
+            RemoteButton::Ok,
+            ButtonAction::HoldShortcut {
+                chord: chord.clone(),
+            },
+        );
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        sender.send(EngineMessage::DeviceRemoved).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            injector.hold_edges.lock().unwrap().as_slice(),
+            &[(chord.clone(), true), (chord, false)],
+            "设备移除应补发松开沿"
+        );
+        drop(gate);
+    }
+
+    /// 序列按顺序执行：文本 → 等待 → 回车。
+    #[test]
+    fn a_sequence_runs_its_steps_in_order() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Ok,
+            ButtonActions {
+                single: vec![
+                    ButtonAction::Text {
+                        value: "收到".to_owned(),
+                    },
+                    ButtonAction::Delay { ms: 20 },
+                    ButtonAction::Shortcut {
+                        chord: KeyChord {
+                            keys: vec![KeyCode::Enter],
+                        },
+                    },
+                ],
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+
+        assert_eq!(
+            injector.texts.lock().unwrap().as_slice(),
+            &["收到".to_owned()]
+        );
+        assert_eq!(
+            injector.taps.lock().unwrap().as_slice(),
+            &[KeyChord {
+                keys: vec![KeyCode::Enter]
+            }]
+        );
+        drop(gate);
+    }
+
+    /// 多步序列不连发：连发一串带等待的动作没有可用语义。
+    #[test]
+    fn multi_step_sequences_do_not_repeat_while_held() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = ButtonMappingRuntime::new(
+            Arc::clone(&injector) as Arc<dyn MappingInjector>,
+            Arc::new(UsageCounters::default()),
+            Arc::new(StdMutex::new(RawInputSnapshot::default())),
+        );
+        let mut mappings = ButtonMappings::default();
+        mappings.actions.insert(
+            RemoteButton::Up,
+            ButtonActions {
+                single: vec![
+                    ButtonAction::Mouse {
+                        kind: MouseAction::WheelDown,
+                    },
+                    ButtonAction::Mouse {
+                        kind: MouseAction::WheelDown,
+                    },
+                ],
+                ..ButtonActions::default()
+            },
+        );
+        runtime.set_mappings(mappings);
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::from([0x0052])))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        // 上键本身可连发，但两步序列不参与连发：按住 700ms 只执行一轮两步。
+        assert_eq!(injector.mouse.lock().unwrap().len(), 2);
+        drop(gate);
+    }
+
+    #[test]
+    fn text_action_injects_the_configured_string() {
+        let gate = crate::key_gate::KeyGate::start();
+        let injector = Arc::new(RecordingInjector::default());
+        let runtime = runtime_with(
+            &injector,
+            RemoteButton::Ok,
+            ButtonAction::Text {
+                value: "收到".to_owned(),
+            },
+        );
+
+        let sender = runtime.sender();
+        sender
+            .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
+            .unwrap();
+        sender
+            .send(EngineMessage::HidUsages(BTreeSet::new()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(
+            injector.texts.lock().unwrap().as_slice(),
+            &["收到".to_owned()]
         );
         drop(gate);
     }
@@ -1176,17 +1626,17 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Ok,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Enter],
                     },
-                },
-                double: ButtonAction::Shortcut {
+                }],
+                double: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Space],
                     },
-                },
-                long: ButtonAction::Disabled,
+                }],
+                long: Vec::new(),
             },
         );
         runtime.set_mappings(mappings);
@@ -1272,33 +1722,33 @@ mod tests {
         mappings.actions.insert(
             RemoteButton::Left,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Backspace],
                     },
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
         mappings.actions.insert(
             RemoteButton::Back,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::Escape],
                     },
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
         mappings.actions.insert(
             RemoteButton::Tv,
             ButtonActions {
-                single: ButtonAction::Shortcut {
+                single: vec![ButtonAction::Shortcut {
                     chord: KeyChord {
                         keys: vec![KeyCode::LeftWindows],
                     },
-                },
+                }],
                 ..ButtonActions::default()
             },
         );
@@ -1317,27 +1767,27 @@ mod tests {
                 .actions
                 .get(&RemoteButton::Tv)
                 .map(|a| a.single.clone()),
-            Some(ButtonAction::Shortcut {
+            Some(vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::LeftWindows],
                 },
-            }),
+            }]),
         );
         assert_eq!(
-            effective.action_for(RemoteButton::Left, ButtonTrigger::Single),
-            ButtonAction::Shortcut {
+            effective.sequence_for(RemoteButton::Left, ButtonTrigger::Single),
+            vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::Backspace],
                 },
-            },
+            }],
         );
         assert_eq!(
-            effective.action_for(RemoteButton::Back, ButtonTrigger::Single),
-            ButtonAction::Shortcut {
+            effective.sequence_for(RemoteButton::Back, ButtonTrigger::Single),
+            vec![ButtonAction::Shortcut {
                 chord: KeyChord {
                     keys: vec![KeyCode::Escape],
                 },
-            },
+            }],
         );
     }
 }

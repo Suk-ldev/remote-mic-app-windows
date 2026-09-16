@@ -9,8 +9,9 @@ import AboutPage from "./pages/AboutPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
+import ReadinessPage from "./pages/ReadinessPage.vue";
 
-const activePage = ref<PageId>("buttons");
+const activePage = ref<PageId>("readiness");
 const runtime = ref<RuntimeSnapshot | null>(null);
 const loadError = ref("");
 const { bannerVisible, info: updateInfo, dismissBanner, runStartupSilentCheck } = useAppUpdate();
@@ -19,6 +20,7 @@ let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
 let initialRuntimeReported = false;
 
 const activeComponent = computed(() => ({
+  readiness: ReadinessPage,
   buttons: ButtonsPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,
@@ -90,7 +92,7 @@ onUnmounted(() => {
           ×
         </button>
       </div>
-      <component :is="activeComponent" :runtime="runtime" />
+      <component :is="activeComponent" :runtime="runtime" @navigate="activePage = $event" />
     </main>
   </div>
 </template>

@@ -14,6 +14,14 @@ import {
   getButtonMappings,
   identityShortcutByButton,
   importButtonMappingConfiguration,
+  buttonsForProfile,
+  getInjectionHoldMs,
+  setInjectionHoldMs,
+  getAppProfiles,
+  saveAppProfiles,
+  getActiveAppProfile,
+  listMappingPresets,
+  applyMappingPreset,
   listPresetApps,
   MODIFIER_KEY_CODES,
   pickCustomApp,
@@ -21,6 +29,12 @@ import {
   resetButtonMappings,
   saveButtonMappings,
   shortcutCapability,
+  mouseActionLabels,
+  MAX_TEXT_CHARS,
+  MAX_SEQUENCE_STEPS,
+  MAX_DELAY_MS,
+  sequenceSummary,
+  type MouseAction,
   startRawInput,
   startShortcutCapture,
   stopRawInput,
@@ -36,6 +50,8 @@ import {
   type ButtonTrigger,
   type FiredGesture,
   type KeyCode,
+  type AppProfileBindings,
+  type MappingPresetInfo,
   type PresetAppInfo,
   type RawInputPhase,
   type RemoteButton,
@@ -177,6 +193,9 @@ const buttonIcons: Record<RemoteButton, string[]> = {
   volume_up: ["M11 5.5L6.5 9H3v6h3.5L11 18.5z", "M15.5 9.5l5 5", "M20.5 9.5l-5 5"],
   volume_down: ["M11 5.5L6.5 9H3v6h3.5L11 18.5z", "M15 12h5.5"],
   volume_mute: ["M11 5.5L6.5 9H3v6h3.5L11 18.5z", "M15.5 9.5l5 5", "M20.5 9.5l-5 5"],
+  // Google TV 遥控器专属键：用中性的"播放"与"方块"形状，不画任何品牌标识。
+  youtube: ["M3 7.2h18a1 1 0 0 1 1 1v7.6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V8.2a1 1 0 0 1 1-1z", "M10.2 9.6l4.6 2.4-4.6 2.4z"],
+  netflix: ["M6.5 3.5h3.2l7.8 17h-3.2z", "M6.5 3.5v17", "M17.5 3.5v17"],
 };
 /** 语音键图标（Mac mic.fill：实心话筒）。 */
 const VOICE_ICON_FILLED = "M12 2.8a3.4 3.4 0 0 1 3.4 3.4v5.6a3.4 3.4 0 0 1-6.8 0V6.2A3.4 3.4 0 0 1 12 2.8z";
@@ -186,6 +205,17 @@ const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
 /** 已安装的预设应用（打开应用动作可选列表）。 */
 const presetApps = ref<PresetAppInfo[]>([]);
+const mappingPresets = ref<MappingPresetInfo[]>([]);
+const selectedPreset = ref("");
+const injectionHoldMs = ref(30);
+const appProfiles = ref<AppProfileBindings>({ enabled: false, bindings: {} });
+const activeProfile = ref<string | null>(null);
+const newBindingProcess = ref("");
+const newBindingPreset = ref("");
+let activeProfileTimer: ReturnType<typeof setInterval> | undefined;
+/** 文本动作草稿：与当前编辑格同步，点"应用文本"才写入映射。 */
+const textDraft = ref("");
+const MOUSE_ACTION_OPTIONS = Object.keys(mouseActionLabels) as MouseAction[];
 const selectedButton = ref<RemoteButton | null>(null);
 const editingTarget = ref<{ button: RemoteButton; trigger: ButtonTrigger } | null>(null);
 const editorPanel = ref<HTMLElement | null>(null);
@@ -253,20 +283,28 @@ const voiceActive = computed(
 function actionsOf(button: RemoteButton): ButtonActions {
   return (
     mappings.value.actions[button] ?? {
-      single: { type: "disabled" },
-      double: { type: "disabled" },
-      long: { type: "disabled" },
+      single: [],
+      double: [],
+      long: [],
     }
   );
 }
 
-function actionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction {
+/** 某个触发格的动作序列（空数组 = 未配置）。 */
+function sequenceOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction[] {
   return actionsOf(button)[trigger];
+}
+
+/** 单步序列的那一步；空序列或多步序列返回 null（模板类型收窄用）。 */
+function soleActionOf(button: RemoteButton, trigger: ButtonTrigger): ButtonAction | null {
+  const sequence = sequenceOf(button, trigger);
+  return sequence.length === 1 ? sequence[0]! : null;
 }
 
 /** 当前编辑格的打开应用目标（非 open_app 动作返回 null，模板类型收窄用）。 */
 function openAppTargetOf(button: RemoteButton, trigger: ButtonTrigger): string | null {
-  const action = actionOf(button, trigger);
+  const action = soleActionOf(button, trigger);
+  if (!action) return null;
   return action.type === "open_app" ? action.target : null;
 }
 
@@ -277,7 +315,7 @@ const presetAppIds = computed(() => new Set(presetApps.value.map((app) => app.id
 const customApps = computed<Array<{ path: string; name: string }>>(() => {
   const seen = new Map<string, string>();
   for (const actions of Object.values(mappings.value.actions)) {
-    for (const action of Object.values(actions)) {
+    for (const action of Object.values(actions).flat()) {
       if (action.type === "open_app" && !presetAppIds.value.has(action.target)) {
         const base = action.target.split(/[\\/]/).pop() ?? action.target;
         const name = base.replace(/\.(exe|lnk)$/i, "") || action.target;
@@ -304,10 +342,62 @@ function selectButton(button: RemoteButton): void {
 function openEditor(button: RemoteButton, trigger: ButtonTrigger): void {
   selectedButton.value = button;
   editingTarget.value = { button, trigger };
+  const action = soleActionOf(button, trigger);
+  textDraft.value = action?.type === "text" ? action.value : "";
   if (capturingShortcut.value) void finishShortcutCapture();
 }
 
-function applyAction(action: ButtonAction): void {
+/** 当前编辑格的鼠标动作（非鼠标动作返回 null）。 */
+function currentMouseKind(): MouseAction | null {
+  const target = editingTarget.value;
+  if (!target) return null;
+  const action = soleActionOf(target.button, target.trigger);
+  return action?.type === "mouse" ? action.kind : null;
+}
+
+/**
+ * 按住快捷键只在单击列、且该键未配置双击/长按时可用：与 Rust 侧
+ * ButtonMappings::normalized 的降级规则一致，UI 先行拦住不可用的组合。
+ */
+const holdShortcutAvailable = computed(() => {
+  const target = editingTarget.value;
+  if (!target || target.trigger !== "single") return false;
+  const actions = actionsOf(target.button);
+  return (
+    actions.double.length === 0 &&
+    actions.long.length === 0 &&
+    sequenceOf(target.button, "single").length <= 1
+  );
+});
+
+const holdShortcutActive = computed(() => {
+  const target = editingTarget.value;
+  if (!target) return false;
+  return soleActionOf(target.button, target.trigger)?.type === "hold_shortcut";
+});
+
+/** 在"点按"与"按住"之间切换当前格的快捷键，和弦保持不变。 */
+function toggleHoldShortcut(): void {
+  const target = editingTarget.value;
+  if (!target) return;
+  const action = soleActionOf(target.button, target.trigger);
+  if (action?.type === "shortcut" && holdShortcutAvailable.value) {
+    applyAction({ type: "hold_shortcut", chord: action.chord });
+  } else if (action?.type === "hold_shortcut") {
+    applyAction({ type: "shortcut", chord: action.chord });
+  }
+}
+
+function applyTextDraft(): void {
+  const value = textDraft.value;
+  if (!value) return;
+  applyAction({ type: "text", value: value.slice(0, MAX_TEXT_CHARS) });
+}
+
+/** 追加模式：开启后点动作是往序列末尾加一步，关闭时是整格替换。 */
+const appendMode = ref(false);
+
+function writeSequence(sequence: ButtonAction[]): void {
   const target = editingTarget.value;
   if (!target) return;
   const next: ButtonMappings = {
@@ -315,11 +405,48 @@ function applyAction(action: ButtonAction): void {
     actions: { ...mappings.value.actions },
   };
   const actions = { ...actionsOf(target.button) };
-  actions[target.trigger] = action;
+  actions[target.trigger] = sequence;
   next.actions[target.button] = actions;
   mappings.value = next;
   // 对齐 Mac：点击动作即自动保存生效（静默；失败时显示错误信息）。
   void persist();
+}
+
+const editingSequence = computed(() =>
+  editingTarget.value
+    ? sequenceOf(editingTarget.value.button, editingTarget.value.trigger)
+    : [],
+);
+
+const sequenceFull = computed(() => editingSequence.value.length >= MAX_SEQUENCE_STEPS);
+
+function applyAction(action: ButtonAction): void {
+  if (!editingTarget.value) return;
+  if (appendMode.value) {
+    if (sequenceFull.value) {
+      statusMessage.value = `一个触发格最多 ${MAX_SEQUENCE_STEPS} 步`;
+      return;
+    }
+    writeSequence([...editingSequence.value, action]);
+    return;
+  }
+  writeSequence([action]);
+}
+
+function removeStep(index: number): void {
+  writeSequence(editingSequence.value.filter((_, at) => at !== index));
+}
+
+function clearSequence(): void {
+  writeSequence([]);
+}
+
+const delayDraft = ref(30);
+
+function appendDelay(): void {
+  if (!editingTarget.value || sequenceFull.value) return;
+  const ms = Math.min(Math.max(Math.round(delayDraft.value) || 0, 1), MAX_DELAY_MS);
+  writeSequence([...editingSequence.value, { type: "delay", ms }]);
 }
 
 /**
@@ -380,8 +507,8 @@ const PRESET_GROUPS: Array<{ label: string; items: Array<{ label: string; keys: 
 function isActivePreset(keys: KeyCode[]): boolean {
   const target = editingTarget.value;
   if (!target) return false;
-  const action = actionOf(target.button, target.trigger);
-  if (action.type !== "shortcut") return false;
+  const action = soleActionOf(target.button, target.trigger);
+  if (action?.type !== "shortcut") return false;
   return action.chord.keys.join("+") === keys.join("+");
 }
 
@@ -419,6 +546,99 @@ async function persist(message?: string): Promise<void> {
     if (message) {
       statusMessage.value = message;
     }
+  } catch (error) {
+    statusMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    busy.value = false;
+  }
+}
+
+/**
+ * 当前机型有、但遥控器示意图上没有对应位置的按键（Google TV 的
+ * YouTube / Netflix）。示意图是 RC003 实物图，这些键只能单独列出来配。
+ */
+const offCanvasButtons = computed(() => {
+  const placed = new Set(PLACEMENTS.map((placement) => placement.button));
+  return buttonsForProfile(rawInput.value?.profileId).filter((button) => !placed.has(button));
+});
+
+const selectedPresetNote = computed(
+  () => mappingPresets.value.find((preset) => preset.id === selectedPreset.value)?.note ?? "",
+);
+
+/**
+ * 按键保持时长：注入的 DOWN 与 UP 之间的间隔。零间隔的点按会被轮询键盘状态
+ * 的程序（游戏、部分 Electron / Qt 应用）整个丢掉。
+ */
+const appProfileRows = computed(() =>
+  Object.entries(appProfiles.value.bindings).map(([process, preset]) => ({
+    process,
+    preset,
+    presetName: mappingPresets.value.find((item) => item.id === preset)?.name ?? preset,
+  })),
+);
+
+const activeProfileName = computed(() =>
+  activeProfile.value
+    ? (mappingPresets.value.find((item) => item.id === activeProfile.value)?.name ??
+      activeProfile.value)
+    : null,
+);
+
+async function persistAppProfiles(next: AppProfileBindings): Promise<void> {
+  busy.value = true;
+  try {
+    appProfiles.value = await saveAppProfiles(next);
+    activeProfile.value = await getActiveAppProfile();
+  } catch (error) {
+    statusMessage.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function addAppBinding(): Promise<void> {
+  const process = newBindingProcess.value.trim();
+  const preset = newBindingPreset.value || mappingPresets.value[0]?.id;
+  if (!process || !preset) return;
+  await persistAppProfiles({
+    enabled: true,
+    bindings: { ...appProfiles.value.bindings, [process]: preset },
+  });
+  newBindingProcess.value = "";
+}
+
+async function removeAppBinding(process: string): Promise<void> {
+  const bindings = { ...appProfiles.value.bindings };
+  delete bindings[process];
+  await persistAppProfiles({ ...appProfiles.value, bindings });
+}
+
+async function toggleAppProfiles(enabled: boolean): Promise<void> {
+  await persistAppProfiles({ ...appProfiles.value, enabled });
+}
+
+async function applyInjectionHold(): Promise<void> {
+  const wanted = Math.min(Math.max(Math.round(injectionHoldMs.value) || 0, 0), 1000);
+  try {
+    injectionHoldMs.value = await setInjectionHoldMs(wanted);
+    statusMessage.value = `按键保持时长已设为 ${injectionHoldMs.value} 毫秒`;
+  } catch (error) {
+    statusMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function applyPreset(): Promise<void> {
+  const preset = mappingPresets.value.find((item) => item.id === selectedPreset.value);
+  if (!preset) return;
+  busy.value = true;
+  statusMessage.value = null;
+  try {
+    const saved = await applyMappingPreset(preset.id);
+    mappings.value = saved;
+    savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
+    editingTarget.value = null;
+    statusMessage.value = `已套用「${preset.name}」，未列出的按键回到未配置`;
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -667,14 +887,35 @@ onMounted(async () => {
   window.addEventListener("keydown", handleCaptureKeydown, true);
   window.addEventListener("keyup", handleCaptureKeyup, true);
   window.addEventListener("blur", handleCaptureBlur);
-  const [loaded, snapshot, apps] = await Promise.all([
+  const [loaded, snapshot, apps, presets] = await Promise.all([
     getButtonMappings(),
     getButtonMappingSnapshot(),
     listPresetApps().catch(() => [] as PresetAppInfo[]),
+    listMappingPresets().catch(() => [] as MappingPresetInfo[]),
   ]);
   if (unmounted) {
     return;
   }
+  void getAppProfiles()
+    .then((profiles) => {
+      if (!unmounted) appProfiles.value = profiles;
+    })
+    .catch(() => {});
+  // 轮询当前生效的方案：切换发生在监视线程里，界面只读状态做提示。
+  activeProfileTimer = setInterval(() => {
+    void getActiveAppProfile()
+      .then((profile) => {
+        if (!unmounted) activeProfile.value = profile;
+      })
+      .catch(() => {});
+  }, 1_500);
+  void getInjectionHoldMs()
+    .then((millis) => {
+      if (!unmounted) injectionHoldMs.value = millis;
+    })
+    .catch(() => {});
+  mappingPresets.value = presets;
+  selectedPreset.value = presets[0]?.id ?? "";
   presetApps.value = apps.filter((app) => app.installed);
   registerPresetAppNames(presetApps.value);
   mappings.value = loaded;
@@ -756,6 +997,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unmounted = true;
+  if (activeProfileTimer) clearInterval(activeProfileTimer);
   releasePageResources();
   reportFrontendEvent({
     event: "buttons_page_resource_cleanup",
@@ -787,6 +1029,96 @@ onUnmounted(() => {
         </div>
       </div>
     </header>
+
+    <article v-if="mappingPresets.length" class="card preset-bar">
+      <div class="preset-bar-row">
+        <label class="preset-bar-label" for="mapping-preset">预设方案</label>
+        <select
+          id="mapping-preset"
+          v-model="selectedPreset"
+          class="preset-bar-select"
+          :disabled="busy"
+        >
+          <option v-for="preset in mappingPresets" :key="preset.id" :value="preset.id">
+            {{ preset.name }}
+          </option>
+        </select>
+        <button class="secondary-button" type="button" :disabled="busy || !selectedPreset" @click="applyPreset">
+          套用
+        </button>
+      </div>
+      <p class="muted preset-bar-note">{{ selectedPresetNote }}　套用会整体替换现有映射，未列出的按键回到未配置。</p>
+      <div class="preset-bar-row injection-hold-row">
+        <label class="preset-bar-label" for="app-profile-toggle">按应用自动切换</label>
+        <input
+          id="app-profile-toggle"
+          :checked="appProfiles.enabled"
+          type="checkbox"
+          class="toggle-input"
+          :disabled="busy || !mappingPresets.length"
+          @change="toggleAppProfiles(($event.target as HTMLInputElement).checked)"
+        />
+        <small class="muted">
+          切到绑定的应用时自动套用方案，离开后回到你保存的配置；自动切换不会改写保存的映射。
+        </small>
+      </div>
+      <div v-if="appProfiles.enabled" class="app-profile-panel">
+        <p v-if="activeProfileName" class="muted app-profile-active">
+          当前由「{{ activeProfileName }}」方案接管；切回其他应用即恢复你保存的配置。
+        </p>
+        <ul v-if="appProfileRows.length" class="app-profile-list">
+          <li v-for="row in appProfileRows" :key="row.process" class="app-profile-row">
+            <code>{{ row.process }}</code>
+            <span class="muted">→ {{ row.presetName }}</span>
+            <button
+              class="sequence-remove"
+              type="button"
+              :disabled="busy"
+              :title="`删除 ${row.process} 的绑定`"
+              @click="removeAppBinding(row.process)"
+            >
+              ✕
+            </button>
+          </li>
+        </ul>
+        <p v-else class="muted">还没有绑定。填入进程名（如 chrome）再选方案即可。</p>
+        <div class="text-action-row">
+          <input
+            v-model="newBindingProcess"
+            class="text-action-input"
+            type="text"
+            placeholder="进程名，例如 chrome"
+            :disabled="busy"
+            @keyup.enter="addAppBinding"
+          />
+          <select v-model="newBindingPreset" class="preset-bar-select" :disabled="busy">
+            <option v-for="preset in mappingPresets" :key="preset.id" :value="preset.id">
+              {{ preset.name }}
+            </option>
+          </select>
+          <button class="chip" type="button" :disabled="busy || !newBindingProcess" @click="addAppBinding">
+            添加绑定
+          </button>
+        </div>
+      </div>
+      <div class="preset-bar-row injection-hold-row">
+        <label class="preset-bar-label" for="injection-hold">按键保持</label>
+        <input
+          id="injection-hold"
+          v-model.number="injectionHoldMs"
+          class="delay-input"
+          type="number"
+          min="0"
+          max="1000"
+          :disabled="busy"
+          @change="applyInjectionHold"
+        />
+        <span class="muted">毫秒</span>
+        <small class="muted">
+          注入的按下与松开之间保持这么久。目标应用（游戏、部分 Electron 程序）漏识别时调高到 50。
+        </small>
+      </div>
+    </article>
 
     <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px` }">
       <svg
@@ -871,18 +1203,18 @@ onUnmounted(() => {
             type="button"
             class="mapping-cell"
             :class="{
-              set: actionOf(placement.button, trigger).type !== 'disabled',
+              set: sequenceOf(placement.button, trigger).length > 0,
               editing:
                 editingTarget?.button === placement.button && editingTarget?.trigger === trigger,
               flashed: firedFlash?.button === placement.button && firedFlash?.trigger === trigger,
             }"
             :title="
-              `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${actionSummary(actionOf(placement.button, trigger))}`
+              `${buttonLabels[placement.button]} · ${buttonTriggerLabel(trigger)}：${sequenceSummary(sequenceOf(placement.button, trigger))}`
             "
             @click.stop="openEditor(placement.button, trigger)"
           >
             <small>{{ buttonTriggerLabel(trigger) }}</small>
-            <span>{{ actionSummary(actionOf(placement.button, trigger)) }}</span>
+            <span>{{ sequenceSummary(sequenceOf(placement.button, trigger)) }}</span>
           </button>
         </div>
       </article>
@@ -912,20 +1244,47 @@ onUnmounted(() => {
       </article>
     </div>
 
+    <article v-if="offCanvasButtons.length" class="card off-canvas-buttons">
+      <h2>该遥控器的其他按键</h2>
+      <p class="muted">这些键不在上面的遥控器示意图上（示意图是小米遥控器实物图），在这里配置。</p>
+      <div class="off-canvas-grid">
+        <div v-for="button in offCanvasButtons" :key="button" class="off-canvas-row">
+          <strong>{{ buttonLabels[button] }}</strong>
+          <div class="mapping-cells">
+            <button
+              v-for="trigger in TRIGGERS"
+              :key="trigger"
+              type="button"
+              class="mapping-cell"
+              :class="{
+                set: sequenceOf(button, trigger).length > 0,
+                editing: editingTarget?.button === button && editingTarget?.trigger === trigger,
+              }"
+              :title="`${buttonLabels[button]} · ${buttonTriggerLabel(trigger)}：${sequenceSummary(sequenceOf(button, trigger))}`"
+              @click="openEditor(button, trigger)"
+            >
+              <small>{{ buttonTriggerLabel(trigger) }}</small>
+              <span>{{ sequenceSummary(sequenceOf(button, trigger)) }}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </article>
+
     <article v-if="editingTarget" ref="editorPanel" class="card mapping-editor">
       <div class="card-title-row">
         <div>
           <h2>{{ buttonLabel(editingTarget.button) }} · {{ buttonTriggerLabel(editingTarget.trigger) }}</h2>
-          <p class="muted">当前：{{ actionSummary(actionOf(editingTarget.button, editingTarget.trigger)) }}</p>
+          <p class="muted">当前：{{ sequenceSummary(sequenceOf(editingTarget.button, editingTarget.trigger)) }}</p>
         </div>
         <div class="button-row">
           <button
             class="secondary-button editor-disable-btn"
-            :class="{ 'is-active': actionOf(editingTarget.button, editingTarget.trigger).type === 'disabled' }"
+            :class="{ 'is-active': sequenceOf(editingTarget.button, editingTarget.trigger).length === 0 }"
             type="button"
             :disabled="busy"
             title="只禁用当前格子的映射，此按键恢复原始行为"
-            @click="applyAction({ type: 'disabled' })"
+            @click="clearSequence()"
           >
             禁用按键
           </button>
@@ -934,12 +1293,58 @@ onUnmounted(() => {
       </div>
       <div class="action-sections">
         <p v-if="capabilityNote" class="muted editor-note capability-note">{{ capabilityNote }}</p>
+
+        <section class="action-section">
+          <h4 class="action-section-title">动作序列</h4>
+          <ol v-if="editingSequence.length" class="sequence-list">
+            <li v-for="(step, index) in editingSequence" :key="index" class="sequence-step">
+              <span class="sequence-index">{{ index + 1 }}</span>
+              <span class="sequence-label">{{ actionSummary(step) }}</span>
+              <button
+                class="sequence-remove"
+                type="button"
+                :disabled="busy"
+                :title="`删除第 ${index + 1} 步`"
+                @click="removeStep(index)"
+              >
+                ✕
+              </button>
+            </li>
+          </ol>
+          <p v-else class="muted editor-note">还没有动作。下面点一个动作即可设置。</p>
+          <label class="toggle-row sequence-append-toggle" title="开启后，点下面的动作是往序列末尾加一步；关闭时是整格替换。">
+            <span>追加为下一步</span>
+            <input v-model="appendMode" type="checkbox" class="toggle-input" :disabled="busy" />
+            <small class="muted sequence-append-hint">
+              最多 {{ MAX_SEQUENCE_STEPS }} 步；步骤按顺序执行。
+            </small>
+          </label>
+          <div class="text-action-row">
+            <span class="muted">插入等待</span>
+            <input
+              v-model.number="delayDraft"
+              class="delay-input"
+              type="number"
+              min="1"
+              :max="MAX_DELAY_MS"
+              :disabled="busy || sequenceFull"
+            />
+            <span class="muted">毫秒</span>
+            <button class="chip" type="button" :disabled="busy || sequenceFull" @click="appendDelay">
+              添加等待步骤
+            </button>
+          </div>
+          <p class="muted editor-note">
+            等待步骤给目标应用留出处理时间，例如"输入文字 → 等 30 毫秒 → 回车"。
+            单步最长 {{ MAX_DELAY_MS }} 毫秒，整条序列的等待总和最长 3 秒。
+          </p>
+        </section>
         <section v-if="editorButtonHasNative" class="action-section">
           <h4 class="action-section-title">原生按键</h4>
           <div class="preset-grid">
             <button
               class="chip"
-              :class="{ selected: actionOf(editingTarget.button, editingTarget.trigger).type === 'native' }"
+              :class="{ selected: soleActionOf(editingTarget.button, editingTarget.trigger)?.type === 'native' }"
               type="button"
               title="轻按透传该键的原生 Windows 动作（如 上→方向上）。与长按/双击的快捷键可共存：轻按走原生、长按走快捷键。"
               @click="applyAction({ type: 'native' })"
@@ -1002,6 +1407,47 @@ onUnmounted(() => {
         </section>
 
         <section class="action-section">
+          <h4 class="action-section-title">鼠标</h4>
+          <div class="preset-grid">
+            <button
+              v-for="kind in MOUSE_ACTION_OPTIONS"
+              :key="kind"
+              class="chip"
+              :class="{ selected: currentMouseKind() === kind }"
+              type="button"
+              title="滚轮挂在单击且未配双击/长按时，按住会连续滚动"
+              @click="applyAction({ type: 'mouse', kind })"
+            >
+              {{ mouseActionLabels[kind] }}
+            </button>
+          </div>
+        </section>
+
+        <section class="action-section">
+          <h4 class="action-section-title">文本输出</h4>
+          <div class="text-action-row">
+            <input
+              v-model="textDraft"
+              class="text-action-input"
+              type="text"
+              :maxlength="MAX_TEXT_CHARS"
+              placeholder="按下时输入这段文字"
+              :disabled="busy"
+              @keyup.enter="applyTextDraft"
+            />
+            <button
+              class="chip"
+              type="button"
+              :disabled="busy || !textDraft"
+              @click="applyTextDraft"
+            >
+              应用文本
+            </button>
+          </div>
+          <p class="muted editor-note">按 Unicode 逐字符注入，不依赖当前键盘布局；最多 {{ MAX_TEXT_CHARS }} 个字符。</p>
+        </section>
+
+        <section class="action-section">
           <h4 class="action-section-title">自定义</h4>
           <div class="custom-shortcut-row">
             <button
@@ -1017,6 +1463,23 @@ onUnmounted(() => {
               {{ captureDisplay.length ? chordLabel({ keys: captureDisplay }) : (safeCaptureMode ? "先选择修饰键" : "请按下快捷键组合") }}
             </span>
           </div>
+          <label
+            v-if="holdShortcutActive || (holdShortcutAvailable && soleActionOf(editingTarget.button, editingTarget.trigger)?.type === 'shortcut')"
+            class="toggle-row safe-capture-toggle"
+            title="开启后遥控器按多久就按住多久（按下发 DOWN、松开发 UP），适合按住说话类快捷键。"
+          >
+            <span>按住不放</span>
+            <input
+              :checked="holdShortcutActive"
+              type="checkbox"
+              class="toggle-input"
+              :disabled="busy"
+              @change="toggleHoldShortcut"
+            />
+            <small class="muted safe-capture-hint">
+              只在单击列、且该键未配置双击/长按时可用。
+            </small>
+          </label>
           <label
             class="toggle-row safe-capture-toggle"
             title="开启后，通过界面选择修饰键，键盘只需按主键。"

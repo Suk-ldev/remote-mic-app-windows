@@ -56,6 +56,8 @@ const remoteButtons = [
   "volume_mute",
   "volume_up",
   "volume_down",
+  "youtube",
+  "netflix",
 ] as const satisfies readonly RemoteButton[];
 const buttonTriggers = ["single", "double", "long"] as const satisfies readonly ButtonTrigger[];
 
@@ -119,6 +121,7 @@ describe("Rust and TypeScript IPC contract", () => {
       "phase",
       "remoteName",
       "remoteModel",
+      "batteryLevel",
       "capabilities",
       "voiceState",
       "decodedSamples",
@@ -146,6 +149,7 @@ describe("Rust and TypeScript IPC contract", () => {
     ]);
     expectExactKeys(platformSnapshot.rawInput, [
       "phase",
+      "profileId",
       "matchedDeviceCount",
       "rawEventCount",
       "semanticEdgeCount",

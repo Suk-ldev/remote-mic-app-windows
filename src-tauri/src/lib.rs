@@ -1,3 +1,4 @@
+use sayall_windows::app_profiles::AppProfileBindings;
 use sayall_windows::button_mapping::{ButtonEdgeCallback, ButtonGestureCallback};
 use sayall_windows::raw_input::{RawInputSnapshot, RemoteButton};
 use sayall_windows::send_input::{
@@ -291,6 +292,80 @@ async fn reset_button_mappings(
 }
 
 #[tauri::command]
+fn get_app_profiles(state: tauri::State<'_, AppState>) -> AppProfileBindings {
+    state.platform.app_profiles()
+}
+
+/// 保存「前台应用 → 预设方案」绑定。自动切换只做临时覆盖，不改写用户保存的
+/// 映射配置——否则每切一次应用就把手改的键位覆盖掉。
+#[tauri::command]
+async fn save_app_profiles(
+    bindings: AppProfileBindings,
+    state: tauri::State<'_, AppState>,
+) -> Result<AppProfileBindings, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || -> Result<AppProfileBindings, String> {
+        let saved = settings.save_app_profiles(bindings)?;
+        platform.set_app_profiles(saved.clone());
+        Ok(saved)
+    })
+    .await
+    .map_err(|error| format!("保存应用方案绑定任务失败：{error}"))?
+}
+
+/// 当前由哪个方案接管（null = 用户自己的配置）。
+#[tauri::command]
+fn get_active_app_profile(state: tauri::State<'_, AppState>) -> Option<String> {
+    state.platform.active_app_profile()
+}
+
+#[tauri::command]
+fn list_mapping_presets() -> Vec<sayall_windows::presets::MappingPresetInfo> {
+    sayall_windows::presets::catalog()
+}
+
+/// 套用预设方案：整体替换按键映射（总开关沿用当前配置），持久化后热加载。
+#[tauri::command]
+async fn apply_mapping_preset(
+    preset: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<ButtonMappings, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "shortcut_settings feature=button_mapping action=apply_preset phase=requested preset={preset}"
+    ));
+    let enabled = state.platform.button_mappings().enabled;
+    let mappings = sayall_windows::presets::build(&preset, enabled)
+        .ok_or_else(|| format!("未知的预设方案：{preset}"))?;
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    let result =
+        match tauri::async_runtime::spawn_blocking(move || -> Result<ButtonMappings, String> {
+            let saved = settings.save_button_mappings(mappings)?;
+            platform.set_button_mappings(saved.clone());
+            Ok(saved)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!("套用预设方案任务失败：{error}")),
+        };
+    sayall_windows::gatt_note(match &result {
+        Ok(saved) => format!(
+            "shortcut_settings feature=button_mapping action=apply_preset phase=completed terminal_result=passed preset={preset} {} elapsed_ms={}",
+            button_mapping_log_summary(saved),
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "shortcut_settings feature=button_mapping action=apply_preset phase=completed terminal_result=failed preset={preset} error_domain=settings error_code=save_failed reason=preset_persistence_failed retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    result
+}
+
+#[tauri::command]
 async fn export_button_mapping_configuration(
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
@@ -401,33 +476,60 @@ async fn test_button_mapping(
     trigger: ButtonTrigger,
     state: tauri::State<'_, AppState>,
 ) -> Result<SendInputSnapshot, String> {
-    let action = state.platform.button_mappings().action_for(button, trigger);
+    let sequence = state
+        .platform
+        .button_mappings()
+        .sequence_for(button, trigger);
+    if sequence.is_empty() {
+        return Err("该触发方式当前未配置动作".to_owned());
+    }
     let platform = Arc::clone(&state.platform);
-    match action {
-        ButtonAction::Shortcut { chord } => {
-            tauri::async_runtime::spawn_blocking(move || platform.test_shortcut(chord))
-                .await
-                .map_err(|error| format!("测试快捷键任务失败：{error}"))?
-                .map_err(|error| error.to_string())
+    // 测试整条序列：与真实触发同样按顺序执行，等待步骤照样等。
+    tauri::async_runtime::spawn_blocking(move || -> Result<SendInputSnapshot, String> {
+        let mut last = SendInputSnapshot::default();
+        for action in sequence {
+            last = run_mapping_action(&platform, button, action)?;
         }
+        Ok(last)
+    })
+    .await
+    .map_err(|error| format!("测试按键映射任务失败：{error}"))?
+}
+
+/// 执行一步映射动作（按键映射测试用；真实触发走 button_mapping 引擎）。
+fn run_mapping_action(
+    platform: &sayall_windows::WindowsPlatform,
+    button: RemoteButton,
+    action: ButtonAction,
+) -> Result<SendInputSnapshot, String> {
+    match action {
+        // 测试按住：注入一次完整点按（按住时长由真实按键决定，测试不挂住键）。
+        ButtonAction::Shortcut { chord } | ButtonAction::HoldShortcut { chord } => platform
+            .test_shortcut(chord)
+            .map_err(|error| error.to_string()),
         ButtonAction::Native => {
             let chord = sayall_windows::send_input::native_key(button)
                 .map(|key| KeyChord { keys: vec![key] })
                 .ok_or_else(|| "该按键没有可透传的原生动作".to_owned())?;
-            tauri::async_runtime::spawn_blocking(move || platform.test_shortcut(chord))
-                .await
-                .map_err(|error| format!("测试原生按键任务失败：{error}"))?
+            platform
+                .test_shortcut(chord)
                 .map_err(|error| error.to_string())
         }
-        ButtonAction::OpenApp { target } => tauri::async_runtime::spawn_blocking(move || {
-            platform
-                .launch_app(&target)
-                .map(|_| SendInputSnapshot::default())
-        })
-        .await
-        .map_err(|error| format!("测试打开应用任务失败：{error}"))?
-        .map_err(|error| error.to_string()),
-        ButtonAction::Disabled => Err("该触发方式当前未配置动作".to_owned()),
+        ButtonAction::OpenApp { target } => platform
+            .launch_app(&target)
+            .map(|_| SendInputSnapshot::default())
+            .map_err(|error| error.to_string()),
+        ButtonAction::Mouse { kind } => {
+            platform.test_mouse(kind).map_err(|error| error.to_string())
+        }
+        ButtonAction::Text { value } => platform
+            .test_text(&value)
+            .map_err(|error| error.to_string()),
+        ButtonAction::Delay { ms } => {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(ms)));
+            Ok(SendInputSnapshot::default())
+        }
+        ButtonAction::Disabled => Ok(SendInputSnapshot::default()),
     }
 }
 
@@ -478,6 +580,140 @@ fn stop_shortcut_capture() {
         "shortcut_capture action=stop phase=completed terminal_result=passed pending_key_ups=paired"
             .to_owned(),
     );
+}
+
+/// 诊断日志尾部（最近 64 KiB）：界面里直接看，不必让用户去翻 LocalAppData。
+#[tauri::command]
+fn get_diagnostic_log_tail() -> Result<String, String> {
+    sayall_windows::read_diagnostic_log_tail(64 * 1024)
+}
+
+#[tauri::command]
+fn get_diagnostic_log_path() -> Option<String> {
+    sayall_windows::diagnostic_log_path().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn clear_diagnostic_log_file() -> Result<(), String> {
+    let result = sayall_windows::clear_diagnostic_log();
+    sayall_windows::gatt_note(format!(
+        "diagnostic_log action=clear phase=completed terminal_result={}",
+        if result.is_ok() { "passed" } else { "failed" }
+    ));
+    result
+}
+
+/// 读取输入法自己配置的按住型语音热键，直接填进本应用——省掉"两边手动对齐"
+/// 这一步。只读不写；读不到如实报错，不猜默认值。
+#[tauri::command]
+async fn detect_ime_voice_hotkey(
+    tool: sayall_windows::ime_hotkey::ImeTool,
+) -> Result<VoiceHotkeySettings, String> {
+    let started = std::time::Instant::now();
+    sayall_windows::gatt_note(format!(
+        "voice_hotkey action=detect phase=requested tool={tool:?}"
+    ));
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<KeyChord, String> {
+        let appdata = sayall_windows::ime_hotkey::appdata_root()
+            .ok_or_else(|| "读不到 APPDATA 目录，无法定位输入法配置".to_owned())?;
+        sayall_windows::ime_hotkey::detect(tool, &appdata).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("读取输入法热键任务失败：{error}"))?;
+    sayall_windows::gatt_note(match &result {
+        Ok(chord) => format!(
+            "voice_hotkey action=detect phase=completed terminal_result=passed tool={tool:?} key_count={} elapsed_ms={}",
+            chord.keys.len(),
+            started.elapsed().as_millis()
+        ),
+        Err(_) => format!(
+            "voice_hotkey action=detect phase=completed terminal_result=failed tool={tool:?} error_domain=ime_config error_code=read_failed reason=config_missing_or_unreadable retryable=true elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    });
+    // 读到的都是"按住说话"型热键；自动切输入法只对微信输入法有意义，保持关闭。
+    Ok(VoiceHotkeySettings {
+        chord: Some(result?),
+        mode: sayall_windows::send_input::VoiceHotkeyMode::Hold,
+        activate_wetype: false,
+    })
+}
+
+#[tauri::command]
+fn get_borrow_default_capture() -> bool {
+    sayall_windows::default_capture::is_enabled()
+}
+
+/// 语音期间临时切换系统默认录音设备。默认关闭：走的是未公开 COM 接口，
+/// 且会影响同时在录音的其它程序（会议、录屏）。
+#[tauri::command]
+async fn set_borrow_default_capture(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        settings.save_borrow_default_capture(enabled)?;
+        sayall_windows::default_capture::set_enabled(enabled);
+        Ok(enabled)
+    })
+    .await
+    .map_err(|error| format!("保存默认麦克风切换设置任务失败：{error}"))?
+}
+
+/// 启动自检：默认录音设备如果还停在虚拟声卡上，说明上次没还原干净
+/// （多半是崩溃）。返回当前设备名供界面提示；不自动改设备。
+#[tauri::command]
+fn check_stale_default_capture() -> Option<String> {
+    let name = sayall_windows::default_capture::current_default_capture_name()?;
+    sayall_windows::default_capture::looks_like_stale_borrow(&name).then_some(name)
+}
+
+/// 按键保持时长（毫秒）：注入的 DOWN 与 UP 之间的间隔。
+#[tauri::command]
+fn get_injection_hold_ms(state: tauri::State<'_, AppState>) -> u32 {
+    state.platform.injection_hold().as_millis() as u32
+}
+
+#[tauri::command]
+async fn set_injection_hold_ms(
+    millis: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<u32, String> {
+    let clamped = millis.min(1_000);
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || -> Result<u32, String> {
+        settings.save_injection_hold_ms(clamped)?;
+        platform.set_injection_hold(std::time::Duration::from_millis(u64::from(clamped)));
+        Ok(clamped)
+    })
+    .await
+    .map_err(|error| format!("保存按键保持时长任务失败：{error}"))?
+}
+
+#[tauri::command]
+fn get_voice_enhance(state: tauri::State<'_, AppState>) -> bool {
+    state.platform.voice_dsp().enhance
+}
+
+/// 语音增强开关：持久化后立即写入平台，对下一段语音会话生效。
+#[tauri::command]
+async fn set_voice_enhance(
+    enabled: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let settings = state.settings.clone();
+    let platform = Arc::clone(&state.platform);
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        settings.save_voice_enhance(enabled)?;
+        let mut dsp = platform.voice_dsp();
+        dsp.enhance = enabled;
+        platform.set_voice_dsp(dsp);
+        Ok(enabled)
+    })
+    .await
+    .map_err(|error| format!("保存语音增强设置任务失败：{error}"))?
 }
 
 #[tauri::command]
@@ -1098,6 +1334,15 @@ pub fn run() {
             };
             // 启动即热加载已保存映射（引擎与门控吞键配置同步就绪）。
             platform.set_button_mappings(button_mappings);
+            platform.set_voice_dsp(saved_settings.voice_dsp());
+            sayall_windows::default_capture::set_enabled(saved_settings.borrow_default_capture);
+            match settings.load_app_profiles() {
+                Ok(profiles) => platform.set_app_profiles(profiles),
+                Err(error) => eprintln!("{error}"),
+            }
+            platform.set_injection_hold(std::time::Duration::from_millis(u64::from(
+                saved_settings.injection_hold_ms,
+            )));
 
             #[cfg(windows)]
             if let (Some(endpoint_id), Some(endpoint_name)) = (
@@ -1190,12 +1435,28 @@ pub fn run() {
         get_button_mappings,
         save_button_mappings,
         reset_button_mappings,
+        list_mapping_presets,
+        apply_mapping_preset,
+        get_app_profiles,
+        save_app_profiles,
+        get_active_app_profile,
         export_button_mapping_configuration,
         import_button_mapping_configuration,
         test_button_mapping,
         list_preset_apps,
         pick_custom_app,
         get_button_mapping_snapshot,
+        get_voice_enhance,
+        set_voice_enhance,
+        get_injection_hold_ms,
+        set_injection_hold_ms,
+        detect_ime_voice_hotkey,
+        get_borrow_default_capture,
+        set_borrow_default_capture,
+        check_stale_default_capture,
+        get_diagnostic_log_tail,
+        get_diagnostic_log_path,
+        clear_diagnostic_log_file,
         start_shortcut_capture,
         stop_shortcut_capture,
         get_send_input_snapshot,
@@ -1229,12 +1490,28 @@ pub fn run() {
         get_button_mappings,
         save_button_mappings,
         reset_button_mappings,
+        list_mapping_presets,
+        apply_mapping_preset,
+        get_app_profiles,
+        save_app_profiles,
+        get_active_app_profile,
         export_button_mapping_configuration,
         import_button_mapping_configuration,
         test_button_mapping,
         list_preset_apps,
         pick_custom_app,
         get_button_mapping_snapshot,
+        get_voice_enhance,
+        set_voice_enhance,
+        get_injection_hold_ms,
+        set_injection_hold_ms,
+        detect_ime_voice_hotkey,
+        get_borrow_default_capture,
+        set_borrow_default_capture,
+        check_stale_default_capture,
+        get_diagnostic_log_tail,
+        get_diagnostic_log_path,
+        clear_diagnostic_log_file,
         start_shortcut_capture,
         stop_shortcut_capture,
         get_send_input_snapshot,

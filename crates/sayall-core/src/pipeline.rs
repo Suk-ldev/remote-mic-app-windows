@@ -1,6 +1,6 @@
 use crate::{
-    process_pcm, AtvvCapabilities, AtvvControlEvent, AtvvError, FrameAccumulator, ImaAdpcmDecoder,
-    VoiceSession, VoiceSessionError, VoiceSessionEvent, VoiceSessionState,
+    AtvvCapabilities, AtvvControlEvent, AtvvError, FrameAccumulator, ImaAdpcmDecoder, VoiceDsp,
+    VoiceDspSettings, VoiceSession, VoiceSessionError, VoiceSessionEvent, VoiceSessionState,
 };
 use thiserror::Error;
 
@@ -38,7 +38,7 @@ pub struct AtvvVoicePipeline {
     accumulator: FrameAccumulator,
     decoder: ImaAdpcmDecoder,
     pending_sync: Option<(i16, u8)>,
-    gain_db: f32,
+    dsp: VoiceDsp,
 }
 
 impl Default for AtvvVoicePipeline {
@@ -49,7 +49,7 @@ impl Default for AtvvVoicePipeline {
             accumulator: FrameAccumulator::default(),
             decoder: ImaAdpcmDecoder::default(),
             pending_sync: None,
-            gain_db: 0.0,
+            dsp: VoiceDsp::default(),
         }
     }
 }
@@ -72,11 +72,21 @@ impl AtvvVoicePipeline {
     }
 
     pub fn set_gain_db(&mut self, gain_db: f32) {
-        self.gain_db = if gain_db.is_finite() {
-            gain_db.clamp(0.0, 24.0)
-        } else {
-            0.0
-        };
+        let mut settings = self.dsp.settings();
+        settings.gain_db = gain_db;
+        self.dsp.set_settings(settings);
+    }
+
+    pub fn dsp_settings(&self) -> VoiceDspSettings {
+        self.dsp.settings()
+    }
+
+    /// 幂等：设置未变时不重置滤波器状态，可在每次控制事件前无脑调用。
+    pub fn set_dsp_settings(&mut self, settings: VoiceDspSettings) {
+        let settings = settings.normalized();
+        if self.dsp.settings() != settings {
+            self.dsp.set_settings(settings);
+        }
     }
 
     pub fn handle_control(&mut self, bytes: &[u8]) -> Result<PipelineOutput, PipelineError> {
@@ -115,6 +125,8 @@ impl AtvvVoicePipeline {
                 self.accumulator.reset();
                 self.pending_sync = None;
                 self.decoder.reset(0, 0);
+                // 滤波器状态跨会话不保留：否则上一段话的尾巴会带进首帧。
+                self.dsp.reset();
                 self.session
                     .apply(VoiceSessionEvent::StreamStarted { session_id })?;
                 Ok(PipelineOutput::StreamStarted {
@@ -171,7 +183,7 @@ impl AtvvVoicePipeline {
                     .reset(i32::from(predictor), i32::from(step_index));
             }
             let decoded = self.decoder.decode(&frame);
-            samples.extend(process_pcm(&decoded, self.gain_db));
+            samples.extend(self.dsp.process(&decoded));
         }
         self.session.apply(VoiceSessionEvent::AudioAccepted {
             sample_count: samples.len(),
