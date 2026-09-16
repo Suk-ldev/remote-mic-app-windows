@@ -441,6 +441,7 @@ mod simulation {
                 last_button: Some(RemoteButton::Ok),
                 last_is_pressed: Some(false),
                 active_buttons: Vec::new(),
+                profile_id: None,
                 last_error: None,
             };
             Ok(state.raw_input.clone())
