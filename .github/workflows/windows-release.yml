@@ -8,7 +8,9 @@ name: Windows Release
 # 4. 创建 DRAFT Release 并挂载资产——人工核对后点 Publish 才对全量用户生效
 #    （releases/latest/download/latest.json 只统计已发布的稳定 Release）。
 on:
+  workflow_dispatch:
   push:
+    branches: ["release/v*"]
     tags: ["v*"]
 
 permissions:
@@ -64,7 +66,16 @@ jobs:
         # -Repository 必须显式传入当前仓库：脚本默认值是上游仓库，分支仓库
         # 若不传，latest.json 里的下载直链会指向上游的 Release（本仓库的
         # 更新包永远取不到）。
-        run: ./scripts/generate-updater-manifest.ps1 -Tag $env:GITHUB_REF_NAME -Repository $env:GITHUB_REPOSITORY
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -like "release/v*") {
+            $tag = $tag -replace "^release/", ""
+          }
+          if ($tag -notmatch "^v\d+\.\d+\.\d+$") {
+            throw "发布 ref 名称必须是 vX.Y.Z tag 或 release/vX.Y.Z 分支，当前为：$env:GITHUB_REF_NAME"
+          }
+          "SAYALL_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          ./scripts/generate-updater-manifest.ps1 -Tag $tag -Repository $env:GITHUB_REPOSITORY
 
       - name: Show staged assets before release (delete-free verification)
         shell: pwsh
@@ -78,7 +89,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
+          $tag = $env:SAYALL_RELEASE_TAG
           $assets = Get-ChildItem -LiteralPath "artifacts/windows-release" -File | ForEach-Object { $_.FullName }
           $notes = @"
           无线麦 SayAll Windows 版 $tag
@@ -88,7 +99,7 @@ jobs:
           - Authenticode 代码签名仍待建立（首次运行可能触发 SmartScreen 提示）
           - 人工核对后 Publish 本草稿：Publish 即对全量用户开启本版本更新（releases/latest 指向最新已发布稳定版）
           "@
-          gh release create $tag --draft --title "无线麦 SayAll Windows $tag" --notes $notes @assets
+          gh release create $tag --target $env:GITHUB_SHA --draft --title "无线麦 SayAll Windows $tag" --notes $notes @assets
           if ($LASTEXITCODE -ne 0) {
             throw "gh release create 失败（exit $LASTEXITCODE；若 Release 已存在请人工核对后处理，本流程不做任何删除/覆盖）"
           }
