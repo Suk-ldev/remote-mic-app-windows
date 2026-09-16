@@ -63,8 +63,7 @@ mod windows_impl {
                 unsafe { windows::core::Interface::query(&unknown, &POLICY_CONFIG_IID, &mut raw) };
             if hr.is_err() || raw.is_null() {
                 return Err(format!(
-                    "当前 Windows 不支持默认设备策略接口（{hr:?}）；请关闭".to_owned()
-                        + "「语音期间临时切换默认麦克风」"
+                    "当前 Windows 不支持默认设备策略接口（{hr:?}）；请关闭「语音期间临时切换默认麦克风」"
                 ));
             }
             Ok(Self(raw))
@@ -125,7 +124,10 @@ mod windows_impl {
     /// 虚拟声卡的**录音**端点 id（CABLE Output）。用户选的是播放端
     /// （CABLE Input），这里要的是它的另一半。
     pub fn find_virtual_cable_capture_id() -> Option<String> {
-        let collection = wasapi::DeviceCollection::new(&Direction::Capture).ok()?;
+        let collection = DeviceEnumerator::new()
+            .ok()?
+            .get_device_collection(&Direction::Capture)
+            .ok()?;
         for device in &collection {
             let device = device.ok()?;
             let name = device.get_friendlyname().ok()?;
