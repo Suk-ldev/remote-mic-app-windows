@@ -1,8 +1,6 @@
-use sayall_windows::raw_input::RawInputSnapshot;
 use sayall_windows::app_profiles::AppProfileBindings;
-use sayall_windows::send_input::{
-    KeyChord, MouseAction, SendInputSnapshot, VoiceHotkeySettings,
-};
+use sayall_windows::raw_input::RawInputSnapshot;
+use sayall_windows::send_input::{KeyChord, MouseAction, SendInputSnapshot, VoiceHotkeySettings};
 use sayall_windows::{
     AudioEndpoint, AudioSnapshot, ConnectionSnapshot, PairedRemote, PlatformError,
     PlatformSnapshot, UsageCounters, WindowsPlatform,
