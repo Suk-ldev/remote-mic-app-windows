@@ -906,7 +906,15 @@ mod tests {
     use crate::raw_input::RemoteButton;
     use crate::send_input::{ButtonAction, ButtonActions, KeyCode};
     use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    static KEY_GATE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_key_gate_test() -> std::sync::MutexGuard<'static, ()> {
+        KEY_GATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// 测试注入器：记录 tap 的和弦与打开应用的目标。
     #[derive(Debug, Default)]
@@ -970,6 +978,21 @@ mod tests {
         }
     }
 
+    fn wait_for_hold_edges(injector: &RecordingInjector, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let actual = injector.hold_edges.lock().unwrap().len();
+            if actual >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待按住快捷键边沿超时：期望 {expected}，实际 {actual}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn mappings_with_single(button: RemoteButton, key: KeyCode) -> ButtonMappings {
         let mut mappings = ButtonMappings::default();
         mappings.actions.insert(
@@ -1012,13 +1035,12 @@ mod tests {
     /// 按压边沿把该键标记为"原生已交付"——同键映射（上→上）的 Single
     /// 跳过注入（原生动作已进 OS），连发/不同键映射/门控路径照常注入。
     ///
-    /// 并行测试下其它用例（open_app）会启停自己的 KeyGate 并拉低共享的
-    /// GATE_ACTIVE：先让出起跑窗口，且每个场景前确保门控存活（先完整
-    /// 退出旧门控再启动新门控，避免 Drop 的 GATE_ACTIVE=false 覆盖新值）。
+    /// KeyGate 使用进程级 GATE_ACTIVE；本模块所有启动门控的测试由
+    /// KEY_GATE_TEST_LOCK 串行。每个场景仍会确认门控存活，并在需要时先完整
+    /// 退出旧门控再启动新门控，避免 Drop 的 GATE_ACTIVE=false 覆盖新值。
     #[test]
     fn leak_suppression_suite() {
-        // 起跑让位：等其它启停门控的用例完成，避免共享 GATE_ACTIVE 抖动。
-        std::thread::sleep(Duration::from_millis(500));
+        let _gate_test_guard = lock_key_gate_test();
         let mut gate: Option<crate::key_gate::KeyGate> = Some(crate::key_gate::KeyGate::start());
         let ensure_gate = |gate: &mut Option<crate::key_gate::KeyGate>| {
             if !crate::key_gate::is_gate_thread_alive() {
@@ -1267,6 +1289,7 @@ mod tests {
     /// 打开应用动作：门控运行时，手势触发应调用 launch_app 而非 tap。
     #[test]
     fn open_app_action_launches_instead_of_tap() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let snapshot = Arc::new(StdMutex::new(RawInputSnapshot::default()));
@@ -1329,6 +1352,7 @@ mod tests {
     /// 滚轮动作：确定键本身不连发，但滚轮按住应连滚（连滚由动作决定）。
     #[test]
     fn wheel_action_injects_on_press_and_repeats_while_held() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let runtime = runtime_with(
@@ -1368,6 +1392,7 @@ mod tests {
     /// 按住快捷键：按下注入 DOWN、松开注入 UP，且不产生点按。
     #[test]
     fn hold_shortcut_injects_paired_down_and_up_edges() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let chord = KeyChord {
@@ -1385,11 +1410,11 @@ mod tests {
         sender
             .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(80));
+        wait_for_hold_edges(&injector, 1);
         sender
             .send(EngineMessage::HidUsages(BTreeSet::new()))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        wait_for_hold_edges(&injector, 2);
 
         assert_eq!(
             injector.hold_edges.lock().unwrap().as_slice(),
@@ -1402,6 +1427,7 @@ mod tests {
     /// 断连不得把按住的键留在按下态：设备移除产生的释放沿要注入 UP。
     #[test]
     fn hold_shortcut_releases_when_the_device_is_removed() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let chord = KeyChord {
@@ -1419,9 +1445,9 @@ mod tests {
         sender
             .send(EngineMessage::HidUsages(hid_usages_of(RemoteButton::Ok)))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(80));
+        wait_for_hold_edges(&injector, 1);
         sender.send(EngineMessage::DeviceRemoved).unwrap();
-        std::thread::sleep(Duration::from_millis(100));
+        wait_for_hold_edges(&injector, 2);
 
         assert_eq!(
             injector.hold_edges.lock().unwrap().as_slice(),
@@ -1434,6 +1460,7 @@ mod tests {
     /// 序列按顺序执行：文本 → 等待 → 回车。
     #[test]
     fn a_sequence_runs_its_steps_in_order() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let runtime = ButtonMappingRuntime::new(
@@ -1486,6 +1513,7 @@ mod tests {
     /// 多步序列不连发：连发一串带等待的动作没有可用语义。
     #[test]
     fn multi_step_sequences_do_not_repeat_while_held() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let runtime = ButtonMappingRuntime::new(
@@ -1527,6 +1555,7 @@ mod tests {
 
     #[test]
     fn text_action_injects_the_configured_string() {
+        let _gate_test_guard = lock_key_gate_test();
         let gate = crate::key_gate::KeyGate::start();
         let injector = Arc::new(RecordingInjector::default());
         let runtime = runtime_with(
