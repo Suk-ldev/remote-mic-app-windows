@@ -657,6 +657,39 @@ export async function setInjectionHoldMs(millis: number): Promise<number> {
   return invoke<number>("set_injection_hold_ms", { millis });
 }
 
+/**
+ * 准备清单的用户侧状态：手动确认过的项 + 整体完成标记。
+ * 检测只是辅助判断——装了虚拟声卡却枚举不到时，用户的确认就是最终结论。
+ */
+export interface ReadinessPreferences {
+  confirmedItems: string[];
+  completed: boolean;
+}
+
+export async function getReadinessPreferences(): Promise<ReadinessPreferences> {
+  if (!isTauriRuntime()) return { confirmedItems: [], completed: false };
+  return invoke<ReadinessPreferences>("get_readiness_preferences");
+}
+
+export async function setReadinessConfirmation(
+  itemId: string,
+  confirmed: boolean,
+): Promise<ReadinessPreferences> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法保存准备项确认");
+  }
+  return invoke<ReadinessPreferences>("set_readiness_confirmation", { itemId, confirmed });
+}
+
+export async function setReadinessCompleted(
+  completed: boolean,
+): Promise<ReadinessPreferences> {
+  if (!isTauriRuntime()) {
+    throw new Error("当前是浏览器预览，无法保存准备完成标记");
+  }
+  return invoke<ReadinessPreferences>("set_readiness_completed", { completed });
+}
+
 /** 诊断日志尾部（最近 64 KiB）。浏览器预览返回占位说明。 */
 export async function getDiagnosticLogTail(): Promise<string> {
   if (!isTauriRuntime()) {

@@ -2,9 +2,13 @@
 import { computed, onMounted } from "vue";
 import type { RuntimeSnapshot, ThemePreference } from "../lib/bridge";
 import { appUpdateProgressText, useAppUpdate } from "../lib/app-update";
+import { useReadiness } from "../lib/readiness";
 import { useTheme } from "../lib/theme";
+import type { PageId } from "../navigation";
 
 defineProps<{ runtime: RuntimeSnapshot | null }>();
+const emit = defineEmits<{ navigate: [PageId] }>();
+const { completed: readinessCompleted, loadReadinessPreferences } = useReadiness();
 
 const {
   phase,
@@ -58,6 +62,7 @@ async function onThemeChange(event: Event): Promise<void> {
 
 onMounted(() => {
   void loadUpdatePreferences();
+  void loadReadinessPreferences();
 });
 </script>
 
@@ -102,6 +107,22 @@ onMounted(() => {
         {{ themePreference === "system" ? "跟随 Windows 的应用颜色模式。" : "该选择会在重启后保持。" }}
       </p>
       <p v-if="themeError" class="error-text" role="alert">{{ themeError }}</p>
+    </article>
+
+    <article v-if="readinessCompleted" class="card settings-card readiness-entry-card">
+      <div class="settings-row">
+        <div class="settings-copy">
+          <strong>准备清单</strong>
+          <p class="muted">
+            必需项都完成过一次，清单已从侧栏收起。换了电脑、重装了虚拟声卡或者想再核对一遍时，从这里打开。
+          </p>
+        </div>
+        <div class="settings-control">
+          <button class="secondary-button" type="button" @click="emit('navigate', 'readiness')">
+            打开准备清单
+          </button>
+        </div>
+      </div>
     </article>
 
     <article class="card">

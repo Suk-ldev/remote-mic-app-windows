@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import type { NavIcon, PageId } from "../navigation";
-import { navigationItems } from "../navigation";
+import type { NavIcon, NavigationItem, PageId } from "../navigation";
 
-defineProps<{ activePage: PageId }>();
+defineProps<{ activePage: PageId; items: NavigationItem[] }>();
 const emit = defineEmits<{ select: [page: PageId] }>();
 
 /**
@@ -28,6 +27,17 @@ const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
       "M7.6 13.6h8.8",
     ],
   },
+  sliders: {
+    // SF "slider.horizontal.3"：三条滑轨 + 交错的滑块
+    strokes: [
+      "M3 7.2h2.1M9.3 7.2H21",
+      "M3 12h11.4M18.6 12H21",
+      "M3 16.8h4.5M11.7 16.8H21",
+      "M9.3 7.2a2.1 2.1 0 1 1-4.2 0 2.1 2.1 0 0 1 4.2 0z",
+      "M18.6 12a2.1 2.1 0 1 1-4.2 0 2.1 2.1 0 0 1 4.2 0z",
+      "M11.7 16.8a2.1 2.1 0 1 1-4.2 0 2.1 2.1 0 0 1 4.2 0z",
+    ],
+  },
   link: {
     // SF "link"：两段互扣链环（对角）
     strokes: [
@@ -51,7 +61,7 @@ const ICON_PATHS: Record<NavIcon, { strokes: string[]; fills?: string[] }> = {
   <aside class="sidebar">
     <nav aria-label="设置页面">
       <button
-        v-for="item in navigationItems"
+        v-for="item in items"
         :key="item.id"
         class="nav-item"
         :class="{ active: activePage === item.id }"

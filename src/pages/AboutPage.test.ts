@@ -44,6 +44,16 @@ vi.mock("../lib/app-update", async (importOriginal) => {
   };
 });
 
+const readinessCompleted = ref(false);
+const loadReadinessPreferences = vi.fn<() => Promise<void>>();
+
+vi.mock("../lib/readiness", () => ({
+  useReadiness: () => ({
+    completed: readinessCompleted,
+    loadReadinessPreferences,
+  }),
+}));
+
 vi.mock("../lib/theme", () => ({
   useTheme: () => ({
     preference: themePreference,
@@ -127,6 +137,24 @@ describe("about page update panel", () => {
     themeBusy.value = false;
     themeError.value = "";
     setThemePreference.mockReset();
+    readinessCompleted.value = false;
+    loadReadinessPreferences.mockReset();
+  });
+
+  it("准备清单没完成时不在关于页重复出现入口", () => {
+    const wrapper = mount(AboutPage, { props: { runtime } });
+    expect(wrapper.find(".readiness-entry-card").exists()).toBe(false);
+  });
+
+  it("准备清单收起后，关于页提供重新打开的入口", async () => {
+    readinessCompleted.value = true;
+    const wrapper = mount(AboutPage, { props: { runtime } });
+    await flushPromises();
+    const entry = wrapper.find(".readiness-entry-card");
+    expect(entry.exists()).toBe(true);
+
+    await entry.find("button").trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["readiness"]);
   });
 
   it("外观选择器提供系统、浅色、深色三档并立即保存", async () => {
