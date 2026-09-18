@@ -729,11 +729,10 @@ async fn set_readiness_completed(
     sayall_windows::gatt_note(format!(
         "readiness_completed completed={completed} phase=requested"
     ));
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        settings.save_readiness_completed(completed)
-    })
-    .await
-    .map_err(|error| format!("保存准备完成标记任务失败：{error}"))?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || settings.save_readiness_completed(completed))
+            .await
+            .map_err(|error| format!("保存准备完成标记任务失败：{error}"))?;
     sayall_windows::gatt_note(format!(
         "readiness_completed completed={completed} phase=persisted result={}",
         if result.is_ok() { "passed" } else { "failed" }
