@@ -127,10 +127,10 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
     "按键画布没有渲染语音键卡片",
   );
   assert(
-    Array.from(document.querySelectorAll(".mapping-cell")).length === 39,
-    "按键页没有渲染画布 12 键与画布外静音键的 39 个触发单元格",
+    Array.from(document.querySelectorAll(".mapping-cell")).length === 36,
+    "按键页没有渲染小米遥控器 12 个按键的 36 个触发单元格",
   );
-  steps.push("按键页渲染画布 12 键、画布外静音键与三列触发单元格");
+  steps.push("按键页渲染小米遥控器 12 键与三列触发单元格");
 
   await saveButtonMappings({
     enabled: true,

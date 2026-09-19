@@ -49,7 +49,11 @@ pub const ALL_BUTTONS: [RemoteButton; 15] = [
 ];
 
 /// 小米遥控器实际存在的按键（[`crate::remote_profile::XIAOMI`] 用）。
-pub const ALL_BUTTONS_XIAOMI: [RemoteButton; 13] = [
+/// 实物只有这 12 个可映射键（电源、语音键不参与映射、方向+确定、返回、
+/// 主页、菜单、音量±、TV），与画布示意图一一对应；**没有静音键**——
+/// 此前表里的 VolumeMute 来自 HID 通用 Mute usage 0x007F（通用码表），
+/// 不是实机观测，静音键只存在于 Google TV 遥控器。
+pub const ALL_BUTTONS_XIAOMI: [RemoteButton; 12] = [
     RemoteButton::Back,
     RemoteButton::Ok,
     RemoteButton::Tv,
@@ -60,7 +64,6 @@ pub const ALL_BUTTONS_XIAOMI: [RemoteButton; 13] = [
     RemoteButton::Up,
     RemoteButton::Menu,
     RemoteButton::Power,
-    RemoteButton::VolumeMute,
     RemoteButton::VolumeUp,
     RemoteButton::VolumeDown,
 ];
@@ -257,7 +260,8 @@ pub fn button_for_usage(usage: u16) -> Option<RemoteButton> {
         0x0052 => RemoteButton::Up,
         0x0065 => RemoteButton::Menu,
         0x0066 => RemoteButton::Power,
-        0x007F => RemoteButton::VolumeMute,
+        // 0x007F（HID 通用 Mute）不解码：支持的小米遥控器没有静音键，
+        // Google TV 遥控器的静音走自己的档案表（0x00E2）。
         0x0080 => RemoteButton::VolumeUp,
         0x0081 => RemoteButton::VolumeDown,
         0x003E => return None,
@@ -272,7 +276,8 @@ pub fn button_for_keyboard(virtual_key: u16, make_code: u16) -> Option<RemoteBut
             0x6A => RemoteButton::Back,
             0x30 => RemoteButton::VolumeUp,
             0x2E => RemoteButton::VolumeDown,
-            0x20 => RemoteButton::VolumeMute,
+            // 小米遥控器没有静音键，厂商键表里不再认 0x20（原条目来自通用
+            // 码表推断，非实机观测）；Google TV 的静音走 VK 0xAD 分支。
             _ => return None,
         });
     }
