@@ -1,5 +1,0 @@
-﻿inject.cpp
-D:\Documents\Projects\remote-mic-app-windows\native\rc003-hook\inject.cpp(1): error C2220: 以下警告被视为错误
-D:\Documents\Projects\remote-mic-app-windows\native\rc003-hook\inject.cpp(1): warning C4819: 该文件包含不能在当前代码页(936)中表示的字符。请将该文件保存为 Unicode 格式以防止数据丢失
-D:\Documents\Projects\remote-mic-app-windows\native\rc003-hook\inject.cpp(252): error C2065: “exit_code”: 未声明的标识符
-D:\Documents\Projects\remote-mic-app-windows\native\rc003-hook\inject.cpp(255): error C2065: “exit_code”: 未声明的标识符

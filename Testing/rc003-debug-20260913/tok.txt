@@ -1,4 +1,0 @@
-﻿app pid=86708
-2026-09-13T04:54:38.546Z pid=86708 rc003_hook start
-2026-09-13T04:54:41.442Z pid=86708 rc003_hook inject stage=hook_installed result=failed win32=13
-2026-09-13T04:54:41.582Z pid=86708 rc003_hook child_exited backoff=15s
