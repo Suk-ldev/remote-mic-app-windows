@@ -1,0 +1,27 @@
+﻿
+
+Path   : Microsoft.PowerShell.Core\FileSystem::D:\Documents\Projects\remote-mic
+         -app-windows\target\rc003-hook\inject.obj
+Owner  : BUILTIN\Administrators
+Group  : WIN-J664I1DKPEV\None
+Access : BUILTIN\Administrators Allow  FullControl
+         NT AUTHORITY\SYSTEM Allow  FullControl
+         NT AUTHORITY\Authenticated Users Allow  Modify, Synchronize
+         BUILTIN\Users Allow  ReadAndExecute, Synchronize
+Audit  : 
+Sddl   : O:BAG:S-1-5-21-4279163230-3138908901-433518127-513D:(A;ID;FA;;;BA)(A;I
+         D;FA;;;SY)(A;ID;0x1301bf;;;AU)(A;ID;0x1200a9;;;BU)
+
+
+
+---DIR---
+
+    目录: D:\Documents\Projects\remote-mic-app-windows\target
+
+
+Path       Owner                  Access                                       
+----       -----                  ------                                       
+rc003-hook BUILTIN\Administrators BUILTIN\Administrators Allow  FullControl... 
+
+
+
