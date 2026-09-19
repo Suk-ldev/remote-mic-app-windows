@@ -436,9 +436,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .chip.selected { border-color: var(--accent-border); background: var(--accent-surface); font-weight: 600; color: var(--accent-text); box-shadow: 0 1px 5px var(--accent-surface); }
 .chip.group-label { cursor: default; font-weight: 600; color: var(--muted); background: transparent; border-style: dashed; }
 .custom-shortcut-row, .text-action-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
-.preset-bar { padding: 12px 16px; margin-bottom: 10px; }
-.preset-bar-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-.preset-bar-label { font-size: 13px; font-weight: 600; }
+/* 设置行（方案页）：左边一句说明、右边一组控件，与"关于"页同一种版式。 */
+.settings-card { padding: 14px 16px; margin-bottom: 10px; }
+.settings-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; }
+.settings-copy { flex: 1 1 320px; min-width: 0; }
+.settings-copy strong { display: block; font-size: 14px; }
+.settings-copy p { margin: 4px 0 0; font-size: 12.5px; }
+.settings-copy .settings-note { margin-top: 2px; }
+.settings-control { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.settings-control .hold-input { flex: 0 0 90px; }
+.presets-page .app-profile-panel { margin-top: 12px; }
 .preset-bar-select {
   flex: 0 1 280px;
   min-width: 0;
@@ -449,8 +456,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   color: inherit;
   font: inherit;
 }
-.preset-bar-note { margin-top: 8px; font-size: 12.5px; }
-.injection-hold-row { margin-top: 10px; }
 .app-profile-panel { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
 .app-profile-active { font-size: 12.5px; margin-bottom: 8px; }
 .app-profile-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -467,13 +472,23 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .readiness-body p { margin-top: 4px; font-size: 12.5px; }
 .readiness-row > .badge { flex: 0 0 auto; margin-top: 1px; }
 .readiness-code { margin-top: 3px; font-size: 12px; font-variant-numeric: tabular-nums; }
-.off-canvas-buttons { padding: 14px 16px; margin-top: 10px; }
-.off-canvas-buttons h2 { font-size: 15px; }
-.off-canvas-buttons p { margin-top: 4px; font-size: 12.5px; }
-.off-canvas-grid { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
-.off-canvas-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
-.off-canvas-row > strong { flex: 0 0 88px; font-size: 13.5px; }
-.off-canvas-row .mapping-cells { flex: 1; min-width: 240px; }
+.readiness-tucked { margin-top: 4px; font-size: 12.5px; }
+/* 右侧操作列：主操作按钮 +（检测不到时的）手动确认，纵向排，不挤成一行。 */
+.readiness-actions { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.readiness-confirm { min-height: 24px; padding: 2px 8px; border: 0; border-radius: 6px; color: var(--accent); background: transparent; cursor: pointer; white-space: nowrap; font-size: 12.5px; font-weight: 600; }
+.readiness-confirm:hover:not(:disabled) { background: var(--accent-hover); }
+/* 画布外按键：与画布卡片同一种卡（同尺寸、同状态样式），排成自适应网格，
+   不再用"标签 + 三个撑满整行的大格子"那种一行到底的排版。 */
+.extra-buttons { padding: 14px 16px; margin-top: 10px; }
+.extra-buttons-head h2 { margin: 0; font-size: 15px; }
+.extra-buttons-head p { margin: 4px 0 0; font-size: 12.5px; }
+.extra-buttons-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.extra-card { position: static; width: auto; }
 .sequence-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .sequence-step { display: flex; align-items: center; gap: 9px; padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface-chip); }
 .sequence-index { flex: 0 0 auto; min-width: 18px; height: 18px; border-radius: 999px; background: var(--accent-surface); color: var(--accent-text); font-size: 11.5px; font-weight: 600; display: grid; place-items: center; }

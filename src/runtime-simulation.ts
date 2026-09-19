@@ -147,6 +147,17 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   assert(sendInput.submittedEvents === 4, "Ctrl+C 仿真没有生成四个按下/释放事件");
   steps.push("映射保存、热加载和 SendInput 记录器通过真实 Tauri IPC");
 
+  await openPage("方案");
+  await waitFor(
+    () => (document.body.textContent?.includes("预设方案") ? true : null),
+    "方案页预设方案设置",
+  );
+  assert(
+    document.body.textContent?.includes("按键保持"),
+    "方案页没有渲染按键保持设置",
+  );
+  steps.push("方案页渲染预设方案、按应用自动切换与按键保持设置");
+
   await openPage("权限");
   await clickButton("生成摘要");
   await waitFor(
@@ -188,7 +199,7 @@ async function runJourney(steps: string[]): Promise<PlatformSnapshot> {
   steps.push("关于页深色/系统外观经 Windows WebView、Tauri capability 与设置持久化闭环");
 
   await openPage("连接与语音");
-  steps.push("五个侧栏页面均在 Windows WebView 中完成导航和渲染");
+  steps.push("侧栏各页面均在 Windows WebView 中完成导航和渲染");
 
   const voice = await invoke<PlatformSnapshot>("run_runtime_simulation_voice_session");
   assert(voice.connection.decodedSamples === 240, "40 + 80 字节语音没有解码为 240 个采样");

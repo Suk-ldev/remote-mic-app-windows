@@ -8,7 +8,7 @@ use sayall_windows::{
     WindowsPlatform,
 };
 use serde::{Deserialize, Serialize};
-use settings::SettingsStore;
+use settings::{ReadinessPreferences, SettingsStore};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
@@ -675,6 +675,79 @@ async fn set_borrow_default_capture(
 fn check_stale_default_capture() -> Option<String> {
     let name = sayall_windows::default_capture::current_default_capture_name()?;
     sayall_windows::default_capture::looks_like_stale_borrow(&name).then_some(name)
+}
+
+/// 准备清单的用户侧状态：手动确认的项 + 整体完成标记。
+#[tauri::command]
+async fn get_readiness_preferences(
+    state: tauri::State<'_, AppState>,
+) -> Result<ReadinessPreferences, String> {
+    let settings = state.settings.clone();
+    tauri::async_runtime::spawn_blocking(move || settings.readiness_preferences())
+        .await
+        .map_err(|error| format!("读取准备清单状态任务失败：{error}"))?
+}
+
+/// 手动确认某个准备项（"我已确认可以使用"）或撤销确认。
+/// 检测只是辅助：装了虚拟声卡却枚举不到时，用户的确认就是最终结论。
+#[tauri::command]
+async fn set_readiness_confirmation(
+    item_id: String,
+    confirmed: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<ReadinessPreferences, String> {
+    let settings = state.settings.clone();
+    let item_id = sanitized_readiness_item_id(&item_id);
+    sayall_windows::gatt_note(format!(
+        "readiness_confirmation item={item_id} confirmed={confirmed} phase=requested"
+    ));
+    let logged_item = item_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        settings.save_readiness_confirmation(item_id, confirmed)
+    })
+    .await
+    .map_err(|error| format!("保存准备项确认任务失败：{error}"))?;
+    match &result {
+        Ok(preferences) => sayall_windows::gatt_note(format!(
+            "readiness_confirmation item={logged_item} confirmed={confirmed} phase=persisted result=passed confirmed_count={}",
+            preferences.confirmed_items.len()
+        )),
+        Err(_) => sayall_windows::gatt_note(format!(
+            "readiness_confirmation item={logged_item} confirmed={confirmed} phase=persisted result=failed error_domain=settings error_code=save_failed retryable=true"
+        )),
+    }
+    result
+}
+
+/// 准备清单整体完成：置位后侧栏收起"准备"，入口移到"关于"页。
+#[tauri::command]
+async fn set_readiness_completed(
+    completed: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<ReadinessPreferences, String> {
+    let settings = state.settings.clone();
+    sayall_windows::gatt_note(format!(
+        "readiness_completed completed={completed} phase=requested"
+    ));
+    let result =
+        tauri::async_runtime::spawn_blocking(move || settings.save_readiness_completed(completed))
+            .await
+            .map_err(|error| format!("保存准备完成标记任务失败：{error}"))?;
+    sayall_windows::gatt_note(format!(
+        "readiness_completed completed={completed} phase=persisted result={}",
+        if result.is_ok() { "passed" } else { "failed" }
+    ));
+    result
+}
+
+/// 准备项 id 只允许出现在日志与设置里的安全字符（清单 id 由前端固定给出，
+/// 这里只做兜底：截断并剔除空白，避免日志被换行注入）。
+fn sanitized_readiness_item_id(item_id: &str) -> String {
+    item_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .take(32)
+        .collect()
 }
 
 /// 按键保持时长（毫秒）：注入的 DOWN 与 UP 之间的间隔。
@@ -1458,6 +1531,9 @@ pub fn run() {
         set_voice_enhance,
         get_injection_hold_ms,
         set_injection_hold_ms,
+        get_readiness_preferences,
+        set_readiness_confirmation,
+        set_readiness_completed,
         detect_ime_voice_hotkey,
         get_borrow_default_capture,
         set_borrow_default_capture,
@@ -1513,6 +1589,9 @@ pub fn run() {
         set_voice_enhance,
         get_injection_hold_ms,
         set_injection_hold_ms,
+        get_readiness_preferences,
+        set_readiness_confirmation,
+        set_readiness_completed,
         detect_ime_voice_hotkey,
         get_borrow_default_capture,
         set_borrow_default_capture,

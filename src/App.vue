@@ -4,14 +4,20 @@ import Sidebar from "./components/Sidebar.vue";
 import { getRuntimeSnapshot, type RuntimeSnapshot } from "./lib/bridge";
 import { reportFrontendEvent } from "./lib/frontend-diagnostics";
 import { useAppUpdate } from "./lib/app-update";
+import { loadReadinessPreferences, useReadiness } from "./lib/readiness";
 import type { PageId } from "./navigation";
+import { visibleNavigationItems } from "./navigation";
 import AboutPage from "./pages/AboutPage.vue";
 import ButtonsPage from "./pages/ButtonsPage.vue";
 import ConnectionPage from "./pages/ConnectionPage.vue";
 import PermissionsPage from "./pages/PermissionsPage.vue";
+import PresetsPage from "./pages/PresetsPage.vue";
 import ReadinessPage from "./pages/ReadinessPage.vue";
 
 const activePage = ref<PageId>("readiness");
+const { completed: readinessCompleted } = useReadiness();
+/** 用户自己点过导航之后，启动逻辑不再改动当前页面。 */
+let userNavigated = false;
 const runtime = ref<RuntimeSnapshot | null>(null);
 const loadError = ref("");
 const { bannerVisible, info: updateInfo, dismissBanner, runStartupSilentCheck } = useAppUpdate();
@@ -22,10 +28,23 @@ let initialRuntimeReported = false;
 const activeComponent = computed(() => ({
   readiness: ReadinessPage,
   buttons: ButtonsPage,
+  presets: PresetsPage,
   connection: ConnectionPage,
   permissions: PermissionsPage,
   about: AboutPage,
 })[activePage.value]);
+
+const navItems = computed(() =>
+  visibleNavigationItems({
+    readinessCompleted: readinessCompleted.value,
+    activePage: activePage.value,
+  }),
+);
+
+function selectPage(page: PageId): void {
+  userNavigated = true;
+  activePage.value = page;
+}
 
 // 横幅不在"关于"页重复显示（页面内已有完整更新面板）。
 const updateBannerVisible = computed(
@@ -33,10 +52,16 @@ const updateBannerVisible = computed(
 );
 
 function showUpdatePage(): void {
-  activePage.value = "about";
+  selectPage("about");
 }
 
 onMounted(async () => {
+  // 准备清单已整体完成过的用户不再从"准备"页进入（该页已收进关于）。
+  void loadReadinessPreferences().then(() => {
+    if (readinessCompleted.value && !userNavigated && activePage.value === "readiness") {
+      activePage.value = "buttons";
+    }
+  });
   const refreshRuntime = async () => {
     try {
       runtime.value = await getRuntimeSnapshot();
@@ -82,7 +107,7 @@ onUnmounted(() => {
 
 <template>
   <div class="app-shell">
-    <Sidebar :active-page="activePage" @select="activePage = $event" />
+    <Sidebar :active-page="activePage" :items="navItems" @select="selectPage" />
     <main class="content">
       <div v-if="loadError" class="error-banner">无法读取运行状态：{{ loadError }}</div>
       <div v-if="updateBannerVisible" class="update-banner">
@@ -92,7 +117,7 @@ onUnmounted(() => {
           ×
         </button>
       </div>
-      <component :is="activeComponent" :runtime="runtime" @navigate="activePage = $event" />
+      <component :is="activeComponent" :runtime="runtime" @navigate="selectPage" />
     </main>
   </div>
 </template>

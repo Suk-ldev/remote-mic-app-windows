@@ -1,6 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import ReadinessPage from "./ReadinessPage.vue";
+import { resetReadinessState } from "../lib/readiness";
 import type { RuntimeSnapshot } from "../lib/bridge";
 
 const mocks = vi.hoisted(() => ({
@@ -10,6 +11,9 @@ const mocks = vi.hoisted(() => ({
   getVoiceHoldHotkey: vi.fn(),
   getButtonMappings: vi.fn(),
   openVbCableDownloadPage: vi.fn(),
+  getReadinessPreferences: vi.fn(),
+  setReadinessConfirmation: vi.fn(),
+  setReadinessCompleted: vi.fn(),
 }));
 
 vi.mock("../lib/bridge", async (importOriginal) => {
@@ -50,8 +54,28 @@ function setup(overrides: Partial<Record<string, unknown>> = {}) {
     overrides.mappings ?? { enabled: true, actions: {} },
   );
   mocks.openVbCableDownloadPage.mockResolvedValue(undefined);
+  mocks.getReadinessPreferences.mockResolvedValue(
+    overrides.preferences ?? { confirmedItems: [], completed: false },
+  );
+  mocks.setReadinessConfirmation.mockImplementation(
+    async (itemId: string, confirmed: boolean) => ({
+      confirmedItems: confirmed ? [itemId] : [],
+      completed: false,
+    }),
+  );
+  mocks.setReadinessCompleted.mockImplementation(async (completed: boolean) => ({
+    confirmedItems: [],
+    completed,
+  }));
   return mount(ReadinessPage, { props: { runtime: null as RuntimeSnapshot | null } });
 }
+
+beforeEach(() => {
+  // 组合式状态是模块级的：不清会串到下一个用例。
+  resetReadinessState();
+  mocks.setReadinessConfirmation.mockClear();
+  mocks.setReadinessCompleted.mockClear();
+});
 
 describe("准备页", () => {
   it("未就绪时列出剩余必需项，并标出必需与可选", async () => {
@@ -114,6 +138,73 @@ describe("准备页", () => {
     expect(row.text()).toContain("小米遥控器 2 Pro");
     expect(row.text()).not.toContain("电量");
     withoutBattery.unmount();
+  });
+
+  it("虚拟声卡没检测到时可以手动确认，确认后这一项算完成", async () => {
+    const wrapper = setup();
+    await flushPromises();
+    expect(wrapper.text()).toContain("还有 4 项必需的没完成");
+
+    const cableRow = wrapper.findAll(".readiness-row")[1]!;
+    const confirm = cableRow.find(".readiness-confirm");
+    expect(confirm.text()).toBe("我已确认可以使用");
+    await confirm.trigger("click");
+    await flushPromises();
+
+    expect(mocks.setReadinessConfirmation).toHaveBeenCalledWith("cable", true);
+    const confirmedRow = wrapper.findAll(".readiness-row")[1]!;
+    expect(confirmedRow.text()).toContain("已确认可用");
+    expect(confirmedRow.text()).toContain("没检测到，但按你的确认记作完成");
+    expect(confirmedRow.text()).not.toContain("READY-CABLE-MISSING");
+    expect(wrapper.text()).toContain("还有 3 项必需的没完成");
+
+    // 撤销后回到按检测结果判断。
+    await confirmedRow.find(".readiness-confirm").trigger("click");
+    await flushPromises();
+    expect(mocks.setReadinessConfirmation).toHaveBeenLastCalledWith("cable", false);
+    expect(wrapper.text()).toContain("还有 4 项必需的没完成");
+    wrapper.unmount();
+  });
+
+  it("已连接遥控器的实时状态项不给手动确认按钮", async () => {
+    const wrapper = setup();
+    await flushPromises();
+    expect(wrapper.findAll(".readiness-row")[0]!.find(".readiness-confirm").exists()).toBe(false);
+    // 语音输出设备是应用内自己的选择，也没有可确认的余地。
+    expect(wrapper.findAll(".readiness-row")[2]!.find(".readiness-confirm").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("必需项全部满足后写入完成标记，并说明本页已被收起", async () => {
+    const wrapper = setup({
+      connection: { phase: "ready", remoteName: "小米遥控器 2 Pro" },
+      audio: { selectedEndpointName: "CABLE Input" },
+      endpoints: [
+        { id: "cable", name: "CABLE Input", isVirtualCableCandidate: true, isDefault: false },
+      ],
+      hotkey: { chord: { keys: ["left_control"] }, mode: "hold", activateWetype: false },
+    });
+    await flushPromises();
+
+    expect(mocks.setReadinessCompleted).toHaveBeenCalledWith(true);
+    expect(wrapper.text()).toContain("已从侧栏收起");
+    wrapper.unmount();
+  });
+
+  it("已经完成过的清单不重复写入完成标记", async () => {
+    const wrapper = setup({
+      preferences: { confirmedItems: [], completed: true },
+      connection: { phase: "ready", remoteName: "小米遥控器 2 Pro" },
+      audio: { selectedEndpointName: "CABLE Input" },
+      endpoints: [
+        { id: "cable", name: "CABLE Input", isVirtualCableCandidate: true, isDefault: false },
+      ],
+      hotkey: { chord: { keys: ["left_control"] }, mode: "hold", activateWetype: false },
+    });
+    await flushPromises();
+
+    expect(mocks.setReadinessCompleted).not.toHaveBeenCalled();
+    wrapper.unmount();
   });
 
   it("点操作按钮时把目标页面冒泡给外壳", async () => {

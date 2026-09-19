@@ -38,6 +38,12 @@ pub struct AppSettings {
     pub open_window_at_launch: bool,
     pub check_prerelease_updates: bool,
     pub theme_preference: ThemePreference,
+    /// 用户手动确认"我已确认可以使用"的准备项 id。检测只是辅助判断：
+    /// 装了虚拟声卡却没被枚举到时，用户的确认就是最终结论。
+    pub readiness_confirmed_items: Vec<String>,
+    /// 准备清单已整体完成过一次——侧栏收起"准备"，入口移到"关于"。
+    /// 一次性标记：之后某项临时不满足（如遥控器断开）不会再弹回侧栏。
+    pub readiness_completed: bool,
     pub usage_statistics: UsageStatistics,
 }
 
@@ -57,6 +63,8 @@ impl Default for AppSettings {
             open_window_at_launch: true,
             check_prerelease_updates: false,
             theme_preference: ThemePreference::System,
+            readiness_confirmed_items: Vec::new(),
+            readiness_completed: false,
             usage_statistics: UsageStatistics::default(),
         }
     }
@@ -79,10 +87,25 @@ impl AppSettings {
             0.0
         };
         self.injection_hold_ms = self.injection_hold_ms.min(1_000);
+        // 准备项确认：去重并封顶，手改过的设置文件不会让清单无限膨胀。
+        let mut confirmed: Vec<String> = Vec::new();
+        for item in self.readiness_confirmed_items.drain(..) {
+            if item.is_empty() || confirmed.contains(&item) {
+                continue;
+            }
+            if confirmed.len() >= MAX_READINESS_ITEMS {
+                break;
+            }
+            confirmed.push(item);
+        }
+        self.readiness_confirmed_items = confirmed;
         self.usage_statistics = self.usage_statistics.normalized();
         self
     }
 }
+
+/// 准备清单的条目数量上限（当前 5 项，留出扩展余量）。
+const MAX_READINESS_ITEMS: usize = 16;
 
 #[cfg(test)]
 mod tests {
@@ -113,6 +136,32 @@ mod tests {
         assert!(!settings.check_prerelease_updates);
         assert_eq!(settings.theme_preference, ThemePreference::System);
         assert_eq!(settings.usage_statistics, UsageStatistics::default());
+    }
+
+    #[test]
+    fn readiness_confirmations_deduplicate_and_survive_old_settings() {
+        // 旧版设置文件没有这两个字段：默认未确认、未完成。
+        let legacy: AppSettings = serde_json::from_str(
+            r#"{"schema_version":4,"gain_db":0.0,"voice_trigger_mode":"hold"}"#,
+        )
+        .unwrap();
+        let legacy = legacy.normalized();
+        assert!(legacy.readiness_confirmed_items.is_empty());
+        assert!(!legacy.readiness_completed);
+
+        let settings = AppSettings {
+            readiness_confirmed_items: vec![
+                "cable".to_owned(),
+                "cable".to_owned(),
+                String::new(),
+                "endpoint".to_owned(),
+            ],
+            readiness_completed: true,
+            ..AppSettings::default()
+        }
+        .normalized();
+        assert_eq!(settings.readiness_confirmed_items, ["cable", "endpoint"]);
+        assert!(settings.readiness_completed);
     }
 
     #[test]

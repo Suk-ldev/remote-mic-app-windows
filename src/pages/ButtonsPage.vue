@@ -9,24 +9,14 @@ import {
   buttonTriggerLabel,
   chordLabel,
   domCodeToKeyCode,
-  exportButtonMappingConfiguration,
   getButtonMappingSnapshot,
   getButtonMappings,
   identityShortcutByButton,
-  importButtonMappingConfiguration,
   buttonsForProfile,
-  getInjectionHoldMs,
-  setInjectionHoldMs,
-  getAppProfiles,
-  saveAppProfiles,
-  getActiveAppProfile,
-  listMappingPresets,
-  applyMappingPreset,
   listPresetApps,
   MODIFIER_KEY_CODES,
   pickCustomApp,
   registerPresetAppNames,
-  resetButtonMappings,
   saveButtonMappings,
   shortcutCapability,
   mouseActionLabels,
@@ -50,8 +40,6 @@ import {
   type ButtonTrigger,
   type FiredGesture,
   type KeyCode,
-  type AppProfileBindings,
-  type MappingPresetInfo,
   type PresetAppInfo,
   type RawInputPhase,
   type RemoteButton,
@@ -59,8 +47,10 @@ import {
   type RuntimeSnapshot,
   type ShortcutCaptureEdge,
 } from "../lib/bridge";
+import type { PageId } from "../navigation";
 
 const props = defineProps<{ runtime: RuntimeSnapshot | null }>();
+const emit = defineEmits<{ navigate: [PageId] }>();
 
 /** 画布几何：对齐 Mac RemoteMappingCanvas——高度固定 570，宽度流式
  * （占满容器，ResizeObserver 观测）；卡宽 = clamp((宽-260)/2, 270, 300)，
@@ -205,14 +195,6 @@ const mappings = ref<ButtonMappings>({ enabled: true, actions: {} });
 const savedSnapshot = ref<ButtonMappings>({ enabled: true, actions: {} });
 /** 已安装的预设应用（打开应用动作可选列表）。 */
 const presetApps = ref<PresetAppInfo[]>([]);
-const mappingPresets = ref<MappingPresetInfo[]>([]);
-const selectedPreset = ref("");
-const injectionHoldMs = ref(30);
-const appProfiles = ref<AppProfileBindings>({ enabled: false, bindings: {} });
-const activeProfile = ref<string | null>(null);
-const newBindingProcess = ref("");
-const newBindingPreset = ref("");
-let activeProfileTimer: ReturnType<typeof setInterval> | undefined;
 /** 文本动作草稿：与当前编辑格同步，点"应用文本"才写入映射。 */
 const textDraft = ref("");
 const MOUSE_ACTION_OPTIONS = Object.keys(mouseActionLabels) as MouseAction[];
@@ -562,138 +544,8 @@ const offCanvasButtons = computed(() => {
   return buttonsForProfile(rawInput.value?.profileId).filter((button) => !placed.has(button));
 });
 
-const selectedPresetNote = computed(
-  () => mappingPresets.value.find((preset) => preset.id === selectedPreset.value)?.note ?? "",
-);
-
-/**
- * 按键保持时长：注入的 DOWN 与 UP 之间的间隔。零间隔的点按会被轮询键盘状态
- * 的程序（游戏、部分 Electron / Qt 应用）整个丢掉。
- */
-const appProfileRows = computed(() =>
-  Object.entries(appProfiles.value.bindings).map(([process, preset]) => ({
-    process,
-    preset,
-    presetName: mappingPresets.value.find((item) => item.id === preset)?.name ?? preset,
-  })),
-);
-
-const activeProfileName = computed(() =>
-  activeProfile.value
-    ? (mappingPresets.value.find((item) => item.id === activeProfile.value)?.name ??
-      activeProfile.value)
-    : null,
-);
-
-async function persistAppProfiles(next: AppProfileBindings): Promise<void> {
-  busy.value = true;
-  try {
-    appProfiles.value = await saveAppProfiles(next);
-    activeProfile.value = await getActiveAppProfile();
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function addAppBinding(): Promise<void> {
-  const process = newBindingProcess.value.trim();
-  const preset = newBindingPreset.value || mappingPresets.value[0]?.id;
-  if (!process || !preset) return;
-  await persistAppProfiles({
-    enabled: true,
-    bindings: { ...appProfiles.value.bindings, [process]: preset },
-  });
-  newBindingProcess.value = "";
-}
-
-async function removeAppBinding(process: string): Promise<void> {
-  const bindings = { ...appProfiles.value.bindings };
-  delete bindings[process];
-  await persistAppProfiles({ ...appProfiles.value, bindings });
-}
-
-async function toggleAppProfiles(enabled: boolean): Promise<void> {
-  await persistAppProfiles({ ...appProfiles.value, enabled });
-}
-
-async function applyInjectionHold(): Promise<void> {
-  const wanted = Math.min(Math.max(Math.round(injectionHoldMs.value) || 0, 0), 1000);
-  try {
-    injectionHoldMs.value = await setInjectionHoldMs(wanted);
-    statusMessage.value = `按键保持时长已设为 ${injectionHoldMs.value} 毫秒`;
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  }
-}
-
-async function applyPreset(): Promise<void> {
-  const preset = mappingPresets.value.find((item) => item.id === selectedPreset.value);
-  if (!preset) return;
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const saved = await applyMappingPreset(preset.id);
-    mappings.value = saved;
-    savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
-    editingTarget.value = null;
-    statusMessage.value = `已套用「${preset.name}」，未列出的按键回到未配置`;
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function restoreDefaults(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const saved = await resetButtonMappings();
-    mappings.value = saved;
-    savedSnapshot.value = JSON.parse(JSON.stringify(saved)) as ButtonMappings;
-    statusMessage.value = "已恢复默认（全部按键保持原始行为）";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
 async function saveConfiguration(): Promise<void> {
   await persist("配置已保存并生效");
-}
-
-async function exportConfiguration(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const exported = await exportButtonMappingConfiguration();
-    if (exported) statusMessage.value = "按键映射配置已导出";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
-}
-
-async function importConfiguration(): Promise<void> {
-  busy.value = true;
-  statusMessage.value = null;
-  try {
-    const imported = await importButtonMappingConfiguration();
-    if (!imported) return;
-    mappings.value = imported;
-    savedSnapshot.value = JSON.parse(JSON.stringify(imported)) as ButtonMappings;
-    editingTarget.value = null;
-    mappingSnapshot.value = await getButtonMappingSnapshot();
-    statusMessage.value = "按键映射配置已导入并生效";
-  } catch (error) {
-    statusMessage.value = error instanceof Error ? error.message : String(error);
-  } finally {
-    busy.value = false;
-  }
 }
 
 const selectedCaptureModifiers = reactive(new Set<KeyCode>());
@@ -887,35 +739,14 @@ onMounted(async () => {
   window.addEventListener("keydown", handleCaptureKeydown, true);
   window.addEventListener("keyup", handleCaptureKeyup, true);
   window.addEventListener("blur", handleCaptureBlur);
-  const [loaded, snapshot, apps, presets] = await Promise.all([
+  const [loaded, snapshot, apps] = await Promise.all([
     getButtonMappings(),
     getButtonMappingSnapshot(),
     listPresetApps().catch(() => [] as PresetAppInfo[]),
-    listMappingPresets().catch(() => [] as MappingPresetInfo[]),
   ]);
   if (unmounted) {
     return;
   }
-  void getAppProfiles()
-    .then((profiles) => {
-      if (!unmounted) appProfiles.value = profiles;
-    })
-    .catch(() => {});
-  // 轮询当前生效的方案：切换发生在监视线程里，界面只读状态做提示。
-  activeProfileTimer = setInterval(() => {
-    void getActiveAppProfile()
-      .then((profile) => {
-        if (!unmounted) activeProfile.value = profile;
-      })
-      .catch(() => {});
-  }, 1_500);
-  void getInjectionHoldMs()
-    .then((millis) => {
-      if (!unmounted) injectionHoldMs.value = millis;
-    })
-    .catch(() => {});
-  mappingPresets.value = presets;
-  selectedPreset.value = presets[0]?.id ?? "";
   presetApps.value = apps.filter((app) => app.installed);
   registerPresetAppNames(presetApps.value);
   mappings.value = loaded;
@@ -997,7 +828,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   unmounted = true;
-  if (activeProfileTimer) clearInterval(activeProfileTimer);
   releasePageResources();
   reportFrontendEvent({
     event: "buttons_page_resource_cleanup",
@@ -1027,98 +857,16 @@ onUnmounted(() => {
           <span class="status-dot" :class="connectionInfo?.phase === 'streaming' ? 'active' : connectionInfo?.phase === 'ready' ? 'success' : 'pending'"></span>
           <span>{{ connectionInfo?.remoteName ?? "未连接遥控器" }}</span>
         </div>
-      </div>
-    </header>
-
-    <article v-if="mappingPresets.length" class="card preset-bar">
-      <div class="preset-bar-row">
-        <label class="preset-bar-label" for="mapping-preset">预设方案</label>
-        <select
-          id="mapping-preset"
-          v-model="selectedPreset"
-          class="preset-bar-select"
-          :disabled="busy"
+        <button
+          class="secondary-button"
+          type="button"
+          title="预设方案、按应用自动切换、按键保持与配置备份都在「方案」页"
+          @click="emit('navigate', 'presets')"
         >
-          <option v-for="preset in mappingPresets" :key="preset.id" :value="preset.id">
-            {{ preset.name }}
-          </option>
-        </select>
-        <button class="secondary-button" type="button" :disabled="busy || !selectedPreset" @click="applyPreset">
-          套用
+          方案设置…
         </button>
       </div>
-      <p class="muted preset-bar-note">{{ selectedPresetNote }}　套用会整体替换现有映射，未列出的按键回到未配置。</p>
-      <div class="preset-bar-row injection-hold-row">
-        <label class="preset-bar-label" for="app-profile-toggle">按应用自动切换</label>
-        <input
-          id="app-profile-toggle"
-          :checked="appProfiles.enabled"
-          type="checkbox"
-          class="toggle-input"
-          :disabled="busy || !mappingPresets.length"
-          @change="toggleAppProfiles(($event.target as HTMLInputElement).checked)"
-        />
-        <small class="muted">
-          切到绑定的应用时自动套用方案，离开后回到你保存的配置；自动切换不会改写保存的映射。
-        </small>
-      </div>
-      <div v-if="appProfiles.enabled" class="app-profile-panel">
-        <p v-if="activeProfileName" class="muted app-profile-active">
-          当前由「{{ activeProfileName }}」方案接管；切回其他应用即恢复你保存的配置。
-        </p>
-        <ul v-if="appProfileRows.length" class="app-profile-list">
-          <li v-for="row in appProfileRows" :key="row.process" class="app-profile-row">
-            <code>{{ row.process }}</code>
-            <span class="muted">→ {{ row.presetName }}</span>
-            <button
-              class="sequence-remove"
-              type="button"
-              :disabled="busy"
-              :title="`删除 ${row.process} 的绑定`"
-              @click="removeAppBinding(row.process)"
-            >
-              ✕
-            </button>
-          </li>
-        </ul>
-        <p v-else class="muted">还没有绑定。填入进程名（如 chrome）再选方案即可。</p>
-        <div class="text-action-row">
-          <input
-            v-model="newBindingProcess"
-            class="text-action-input"
-            type="text"
-            placeholder="进程名，例如 chrome"
-            :disabled="busy"
-            @keyup.enter="addAppBinding"
-          />
-          <select v-model="newBindingPreset" class="preset-bar-select" :disabled="busy">
-            <option v-for="preset in mappingPresets" :key="preset.id" :value="preset.id">
-              {{ preset.name }}
-            </option>
-          </select>
-          <button class="chip" type="button" :disabled="busy || !newBindingProcess" @click="addAppBinding">
-            添加绑定
-          </button>
-        </div>
-      </div>
-      <div class="preset-bar-row injection-hold-row">
-        <label class="preset-bar-label" for="injection-hold">按键保持</label>
-        <input
-          id="injection-hold"
-          v-model.number="injectionHoldMs"
-          class="delay-input"
-          type="number"
-          min="0"
-          max="1000"
-          :disabled="busy"
-          @change="applyInjectionHold"
-        />
-        <span class="muted">毫秒</span>
-        <small class="muted">
-          注入的按下与松开之间保持这么久。目标应用（游戏、部分 Electron 程序）漏识别时调高到 50。
-        </small>
-      </div>
-    </article>
+    </header>
 
     <div ref="canvasEl" class="mapping-canvas" :style="{ height: `${CANVAS_HEIGHT}px` }">
       <svg
@@ -1244,12 +992,39 @@ onUnmounted(() => {
       </article>
     </div>
 
-    <article v-if="offCanvasButtons.length" class="card off-canvas-buttons">
-      <h2>该遥控器的其他按键</h2>
-      <p class="muted">这些键不在上面的遥控器示意图上（示意图是小米遥控器实物图），在这里配置。</p>
-      <div class="off-canvas-grid">
-        <div v-for="button in offCanvasButtons" :key="button" class="off-canvas-row">
-          <strong>{{ buttonLabels[button] }}</strong>
+    <article v-if="offCanvasButtons.length" class="card extra-buttons">
+      <div class="extra-buttons-head">
+        <h2>其他按键</h2>
+        <p class="muted">
+          这几个键在你的遥控器上有，但不在上面的示意图（小米遥控器实物图）里，在这里配置。
+        </p>
+      </div>
+      <div class="extra-buttons-grid">
+        <article
+          v-for="button in offCanvasButtons"
+          :key="button"
+          class="mapping-card extra-card"
+          :class="{
+            selected: selectedButton === button,
+            active: activeButtons.has(button),
+            flashed: firedFlash?.button === button,
+          }"
+          @click="selectButton(button)"
+        >
+          <div class="mapping-card-title">
+            <svg class="mapping-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path
+                v-for="(path, index) in buttonIcons[button]"
+                :key="index"
+                :d="path"
+                stroke="currentColor"
+                stroke-width="1.9"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+            <strong>{{ buttonLabels[button] }}</strong>
+          </div>
           <div class="mapping-cells">
             <button
               v-for="trigger in TRIGGERS"
@@ -1259,15 +1034,16 @@ onUnmounted(() => {
               :class="{
                 set: sequenceOf(button, trigger).length > 0,
                 editing: editingTarget?.button === button && editingTarget?.trigger === trigger,
+                flashed: firedFlash?.button === button && firedFlash?.trigger === trigger,
               }"
               :title="`${buttonLabels[button]} · ${buttonTriggerLabel(trigger)}：${sequenceSummary(sequenceOf(button, trigger))}`"
-              @click="openEditor(button, trigger)"
+              @click.stop="openEditor(button, trigger)"
             >
               <small>{{ buttonTriggerLabel(trigger) }}</small>
               <span>{{ sequenceSummary(sequenceOf(button, trigger)) }}</span>
             </button>
           </div>
-        </div>
+        </article>
       </div>
     </article>
 
@@ -1546,15 +1322,6 @@ onUnmounted(() => {
       <div class="button-row">
         <button class="secondary-button" type="button" :disabled="busy" @click="saveConfiguration">
           保存配置
-        </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="importConfiguration">
-          导入配置…
-        </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="exportConfiguration">
-          导出配置…
-        </button>
-        <button class="secondary-button" type="button" :disabled="busy" @click="restoreDefaults">
-          恢复默认
         </button>
       </div>
     </footer>

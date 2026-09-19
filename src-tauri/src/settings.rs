@@ -15,6 +15,23 @@ pub struct SettingsStore {
 const BUTTON_MAPPING_EXPORT_VERSION: u32 = 1;
 const MAX_BUTTON_MAPPING_IMPORT_BYTES: u64 = 1024 * 1024;
 
+/// 准备清单的用户侧状态（手动确认的项 + 整体完成标记）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessPreferences {
+    pub confirmed_items: Vec<String>,
+    pub completed: bool,
+}
+
+impl ReadinessPreferences {
+    fn from_settings(settings: AppSettings) -> Self {
+        Self {
+            confirmed_items: settings.readiness_confirmed_items,
+            completed: settings.readiness_completed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ButtonMappingConfiguration {
@@ -116,6 +133,43 @@ impl SettingsStore {
         self.update("保存外观设置", move |settings| {
             settings.theme_preference = preference;
         })
+    }
+
+    pub fn readiness_preferences(&self) -> Result<ReadinessPreferences, String> {
+        self.load().map(ReadinessPreferences::from_settings)
+    }
+
+    /// 手动确认/撤销某个准备项。检测漏报（装了虚拟声卡却枚举不到）时，
+    /// 用户的确认就是最终结论，不再把他堵在清单上。
+    pub fn save_readiness_confirmation(
+        &self,
+        item_id: String,
+        confirmed: bool,
+    ) -> Result<ReadinessPreferences, String> {
+        self.update("保存准备项确认", move |settings| {
+            let items = &mut settings.readiness_confirmed_items;
+            // 先结束查找的不可变借用，再按结果增删（match 会把扫描临时量留到末尾）。
+            let existing = items.iter().position(|item| item == &item_id);
+            match (confirmed, existing) {
+                (true, None) => items.push(item_id.clone()),
+                (false, Some(index)) => {
+                    items.remove(index);
+                }
+                _ => {}
+            }
+        })?;
+        self.readiness_preferences()
+    }
+
+    /// 准备清单整体完成标记：置位后侧栏收起"准备"，入口移到"关于"。
+    pub fn save_readiness_completed(
+        &self,
+        completed: bool,
+    ) -> Result<ReadinessPreferences, String> {
+        self.update("保存准备完成标记", move |settings| {
+            settings.readiness_completed = completed;
+        })?;
+        self.readiness_preferences()
     }
 
     pub fn usage_statistics(&self) -> Result<UsageStatistics, String> {
@@ -385,6 +439,44 @@ mod tests {
         assert!(!store.load().unwrap().check_prerelease_updates);
         store.save_check_prerelease_updates(true).unwrap();
         assert!(store.load().unwrap().check_prerelease_updates);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn readiness_preferences_persist_confirmations_and_completion() {
+        let path = std::env::temp_dir().join(format!(
+            "sayall-test-readiness-preferences-{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SettingsStore::new(path.clone());
+
+        assert_eq!(
+            store.readiness_preferences().unwrap(),
+            ReadinessPreferences::default()
+        );
+
+        let confirmed = store
+            .save_readiness_confirmation("cable".to_owned(), true)
+            .unwrap();
+        assert_eq!(confirmed.confirmed_items, ["cable"]);
+        // 重复确认不产生重复条目。
+        let again = store
+            .save_readiness_confirmation("cable".to_owned(), true)
+            .unwrap();
+        assert_eq!(again.confirmed_items, ["cable"]);
+
+        let completed = store.save_readiness_completed(true).unwrap();
+        assert!(completed.completed);
+        assert_eq!(completed.confirmed_items, ["cable"]);
+
+        let revoked = store
+            .save_readiness_confirmation("cable".to_owned(), false)
+            .unwrap();
+        assert!(revoked.confirmed_items.is_empty());
+        // 撤销单项不会清掉整体完成标记。
+        assert!(revoked.completed);
 
         let _ = std::fs::remove_file(path);
     }

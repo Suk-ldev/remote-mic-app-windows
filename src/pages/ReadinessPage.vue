@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
   getAudioSnapshot,
   getButtonMappings,
@@ -13,6 +13,7 @@ import {
   type RuntimeSnapshot,
   type VoiceHotkeySettings,
 } from "../lib/bridge";
+import { useReadiness } from "../lib/readiness";
 import type { PageId } from "../navigation";
 
 defineProps<{ runtime: RuntimeSnapshot | null }>();
@@ -32,6 +33,11 @@ interface ReadinessItem {
    * 就绪时为 null，不占版面。
    */
   code: string | null;
+  /**
+   * 允许"我已确认可以使用"手动收尾。只给靠环境检测判定的项：
+   * 装了虚拟声卡却枚举不到时，用户的确认就是最终结论，不许清单卡着他。
+   */
+  confirmable?: boolean;
   action?: { label: string; run: () => void | Promise<void> };
 }
 
@@ -42,6 +48,16 @@ const voiceHotkey = ref<VoiceHotkeySettings | null>(null);
 const mappings = ref<ButtonMappings | null>(null);
 const loadError = ref("");
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+const {
+  completed,
+  busy: confirmBusy,
+  errorMessage: confirmError,
+  isReadinessItemConfirmed,
+  confirmReadinessItem,
+  markReadinessCompleted,
+  loadReadinessPreferences,
+} = useReadiness();
 
 async function refresh() {
   try {
@@ -63,7 +79,7 @@ async function refresh() {
   }
 }
 
-const items = computed<ReadinessItem[]>(() => {
+const detectedItems = computed<ReadinessItem[]>(() => {
   const connected =
     connection.value?.phase === "ready" || connection.value?.phase === "streaming";
   const cable = hasVirtualCable.value;
@@ -96,6 +112,7 @@ const items = computed<ReadinessItem[]>(() => {
       status: cable === null ? "读取中" : cable ? "已安装" : "未安装",
       detail: "遥控器麦克风要经虚拟声卡才能被输入法听到。装完需要重启一次 Windows。",
       code: cable === false ? "READY-CABLE-MISSING" : null,
+      confirmable: true,
       action: { label: "打开官方下载页", run: () => openVbCableDownloadPage() },
     },
     {
@@ -116,6 +133,7 @@ const items = computed<ReadinessItem[]>(() => {
       status: hotkeyKeys > 0 ? "已配置" : "未配置",
       detail: "语音键按下时注入这个快捷键，语音工具才会开始录音。搜狗和豆包可在连接页一键读取它们自己的设置。",
       code: hotkeyKeys > 0 ? null : "READY-VOICE-HOTKEY-UNSET",
+      confirmable: true,
       action: { label: "去设置", run: () => emit("navigate", "connection") },
     },
     {
@@ -124,12 +142,32 @@ const items = computed<ReadinessItem[]>(() => {
       required: false,
       tone: mapped ? "success" : "pending",
       status: mapped ? "已配置" : "未配置",
-      detail: "可选。不配置时遥控器按键保持原始行为；映射页有一键套用的预设方案。",
+      detail: "可选。不配置时遥控器按键保持原始行为；方案页有一键套用的预设方案。",
       code: null,
       action: { label: "去配置", run: () => emit("navigate", "buttons") },
     },
   ];
 });
+
+/**
+ * 手动确认覆盖检测结果：确认过的项直接记作完成，错误码随之收起。
+ * overridden = 确认接管了检测（检测本身没通过），界面要说清楚这一点。
+ */
+const items = computed(() =>
+  detectedItems.value.map((item) => {
+    const confirmed = Boolean(item.confirmable) && isReadinessItemConfirmed(item.id);
+    const overridden = confirmed && item.tone !== "success";
+    if (!overridden) return { ...item, confirmed, overridden };
+    return {
+      ...item,
+      confirmed,
+      overridden,
+      tone: "success" as Tone,
+      status: "已确认可用",
+      code: null,
+    };
+  }),
+);
 
 /** 电量文案：读不到就不显示，不用"未知"占位。 */
 const batteryText = computed(() => {
@@ -141,7 +179,17 @@ const remaining = computed(
   () => items.value.filter((item) => item.required && item.tone !== "success").length,
 );
 
+async function toggleConfirmation(itemId: string, confirmed: boolean): Promise<void> {
+  await confirmReadinessItem(itemId, confirmed);
+}
+
+// 必需项全部满足（检测到或手动确认）→ 记下"准备已完成"，侧栏收起本页。
+watch(remaining, (value) => {
+  if (value === 0 && !completed.value) void markReadinessCompleted();
+});
+
 onMounted(() => {
+  void loadReadinessPreferences();
   void refresh();
   pollTimer = setInterval(() => {
     void refresh();
@@ -161,6 +209,9 @@ onUnmounted(() => {
         <p class="muted">
           {{ remaining === 0 ? "必需项都已就绪，可以开始用了。" : `还有 ${remaining} 项必需的没完成，从上往下点一遍即可。` }}
         </p>
+        <p v-if="completed" class="muted readiness-tucked">
+          这一页已从侧栏收起，之后可以在「关于」页重新打开。
+        </p>
       </div>
     </header>
 
@@ -176,16 +227,43 @@ onUnmounted(() => {
           </strong>
           <p class="muted">{{ item.detail }}</p>
           <p v-if="item.code" class="muted readiness-code">错误码 {{ item.code }}（报障时带上这个码）</p>
+          <p v-if="item.overridden" class="muted readiness-code">
+            没检测到，但按你的确认记作完成。
+          </p>
         </div>
-        <button
-          v-if="item.action"
-          class="secondary-button"
-          type="button"
-          @click="item.action.run()"
-        >
-          {{ item.action.label }}
-        </button>
+        <div class="readiness-actions">
+          <button
+            v-if="item.action"
+            class="secondary-button"
+            type="button"
+            @click="item.action.run()"
+          >
+            {{ item.action.label }}
+          </button>
+          <button
+            v-if="item.confirmable && item.confirmed"
+            class="readiness-confirm"
+            type="button"
+            :disabled="confirmBusy"
+            title="撤销后重新按检测结果判断"
+            @click="toggleConfirmation(item.id, false)"
+          >
+            撤销确认
+          </button>
+          <button
+            v-else-if="item.confirmable && item.tone !== 'success'"
+            class="readiness-confirm"
+            type="button"
+            :disabled="confirmBusy"
+            title="装好了但没被检测到时点这里，这一项按已完成处理"
+            @click="toggleConfirmation(item.id, true)"
+          >
+            我已确认可以使用
+          </button>
+        </div>
       </div>
     </article>
+
+    <p v-if="confirmError" class="error-text">{{ confirmError }}</p>
   </section>
 </template>

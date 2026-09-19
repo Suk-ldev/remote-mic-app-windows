@@ -35,33 +35,6 @@ vi.mock("../lib/bridge", async (importOriginal) => {
       lastError: null,
     })),
     saveButtonMappings: vi.fn(async (mappings: unknown) => mappings),
-    exportButtonMappingConfiguration: vi.fn(async () => true),
-    importButtonMappingConfiguration: vi.fn(async () => ({
-      enabled: false,
-      actions: {
-        power: {
-          single: [{ type: "shortcut", chord: { keys: ["escape"] } }],
-          double: [],
-          long: [],
-        },
-      },
-    })),
-    resetButtonMappings: vi.fn(async () => ({ enabled: true, actions: {} })),
-    getInjectionHoldMs: vi.fn(async () => 30),
-    getAppProfiles: vi.fn(async () => ({ enabled: false, bindings: {} })),
-    saveAppProfiles: vi.fn(async (bindings: unknown) => bindings),
-    getActiveAppProfile: vi.fn(async () => null),
-    setInjectionHoldMs: vi.fn(async (millis: number) => millis),
-    applyMappingPreset: vi.fn(async () => ({
-      enabled: true,
-      actions: {
-        up: {
-          single: [{ type: "mouse", kind: "wheel_up" }],
-          double: [],
-          long: [],
-        },
-      },
-    })),
     testButtonMapping: vi.fn(async () => ({
       available: true,
       submittedBatches: 1,
@@ -86,12 +59,7 @@ vi.mock("../lib/bridge", async (importOriginal) => {
 });
 
 import {
-  applyMappingPreset,
-  saveAppProfiles,
-  setInjectionHoldMs,
-  exportButtonMappingConfiguration,
   getButtonMappings,
-  importButtonMappingConfiguration,
   subscribeButtonEdges,
   subscribeButtonGestures,
   saveButtonMappings,
@@ -183,8 +151,6 @@ beforeEach(() => {
   vi.mocked(subscribeButtonEdges).mockClear();
   vi.mocked(subscribeButtonGestures).mockClear();
   vi.mocked(saveButtonMappings).mockClear();
-  vi.mocked(exportButtonMappingConfiguration).mockClear();
-  vi.mocked(importButtonMappingConfiguration).mockClear();
   vi.mocked(startShortcutCapture).mockClear();
   vi.mocked(stopShortcutCapture).mockClear();
 });
@@ -192,11 +158,13 @@ beforeEach(() => {
 describe("buttons mapping page", () => {
   it("renders 12 canvas buttons, the voice card and 39 trigger cells including mute", async () => {
     const wrapper = await mountPage();
-    expect(wrapper.findAll(".mapping-card")).toHaveLength(13);
+    // 画布 12 键 + 语音卡 + 画布外的静音键卡（"其他按键"用的是同一种卡片）。
+    expect(wrapper.findAll(".mapping-card")).toHaveLength(14);
+    expect(wrapper.findAll(".extra-card")).toHaveLength(1);
     // 画布 12 键 × 3 + 画布外的静音键 × 3：静音键可解码却没有示意图位置，
-    // 由"该遥控器的其他按键"补上（见 offCanvasButtons）。
+    // 由"其他按键"补上（见 offCanvasButtons）。
     expect(wrapper.findAll(".mapping-cell")).toHaveLength(39);
-    expect(wrapper.find(".off-canvas-buttons").text()).toContain("静音");
+    expect(wrapper.find(".extra-buttons").text()).toContain("静音");
     const voiceCard = wrapper.find(".voice-card");
     expect(voiceCard.text()).toContain("语音键");
     expect(voiceCard.text()).toContain("按住说话");
@@ -214,7 +182,7 @@ describe("buttons mapping page", () => {
       },
     });
     await flushPromises();
-    const extras = wrapper.find(".off-canvas-buttons").text();
+    const extras = wrapper.find(".extra-buttons").text();
     expect(extras).toContain("YouTube");
     expect(extras).toContain("Netflix");
     // Google 遥控器没有菜单键：画布卡片仍是小米示意图，这里只补差集。
@@ -264,26 +232,30 @@ describe("buttons mapping page", () => {
     intervalSpy.mockRestore();
   });
 
-  it("saves, exports and imports a versioned mapping configuration from the footer", async () => {
+  it("saves the mapping configuration from the footer", async () => {
     const wrapper = await mountPage();
-    const button = (label: string) =>
-      wrapper.findAll(".mapping-footer button").find((item) => item.text() === label)!;
+    const saveButton = wrapper
+      .findAll(".mapping-footer button")
+      .find((item) => item.text() === "保存配置")!;
 
-    await button("保存配置").trigger("click");
+    await saveButton.trigger("click");
     await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
     expect(wrapper.text()).toContain("配置已保存并生效");
 
-    await button("导出配置…").trigger("click");
-    await vi.waitFor(() => expect(exportButtonMappingConfiguration).toHaveBeenCalledOnce());
-    expect(wrapper.text()).toContain("按键映射配置已导出");
+    // 导入/导出/恢复默认已经搬到「方案」页，按键页不再重复提供。
+    const footerLabels = wrapper.findAll(".mapping-footer button").map((item) => item.text());
+    expect(footerLabels).not.toContain("导入配置…");
+    expect(footerLabels).not.toContain("导出配置…");
+    expect(footerLabels).not.toContain("恢复默认");
+  });
 
-    await button("导入配置…").trigger("click");
-    await vi.waitFor(() => expect(importButtonMappingConfiguration).toHaveBeenCalledOnce());
-    expect(wrapper.text()).toContain("按键映射配置已导入并生效");
-    const powerCard = wrapper
-      .findAll(".mapping-card")
-      .find((card) => card.text().includes("电源"))!;
-    expect(powerCard.text()).toContain("Esc");
+  it("头部提供去「方案」页的入口", async () => {
+    const wrapper = await mountPage();
+    const link = wrapper
+      .findAll(".mapping-header-controls button")
+      .find((item) => item.text() === "方案设置…")!;
+    await link.trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["presets"]);
   });
 
   it("marks configured cells and opens the editor with the correct target", async () => {
@@ -585,24 +557,6 @@ describe("buttons mapping page", () => {
     ).toBe(false);
   });
 
-  it("预设方案：选择后套用，整套映射被替换", async () => {
-    const wrapper = await mountPage();
-    const select = wrapper.find(".preset-bar-select");
-    expect(select.findAll("option").length).toBeGreaterThan(1);
-    await select.setValue("reading");
-    const applyButton = wrapper
-      .findAll(".preset-bar .secondary-button")
-      .find((button) => button.text().trim() === "套用")!;
-    await applyButton.trigger("click");
-    await flushPromises();
-    expect(applyMappingPreset).toHaveBeenCalledWith("reading");
-    // 套用返回的映射立即生效：上键显示为滚轮上。
-    const upCard = wrapper
-      .findAll(".mapping-card")
-      .find((card) => card.text().includes("上"))!;
-    expect(upCard.text()).toContain("滚轮上");
-  });
-
   it("鼠标动作：点选滚轮 chip 即时保存为 mouse 动作", async () => {
     const wrapper = await mountPage();
     await openCell(wrapper, "上", 0);
@@ -693,41 +647,6 @@ describe("buttons mapping page", () => {
     const upCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("上"))!;
     expect(upCard.text()).toContain("→");
     expect(upCard.text()).toContain("等 30ms");
-  });
-
-  it("按应用切换方案：开关打开后可添加与删除绑定", async () => {
-    const wrapper = await mountPage();
-    // 默认关闭时不显示绑定面板。
-    expect(wrapper.find(".app-profile-panel").exists()).toBe(false);
-
-    await wrapper.find("#app-profile-toggle").setValue(true);
-    await flushPromises();
-    expect(saveAppProfiles).toHaveBeenCalledWith({ enabled: true, bindings: {} });
-
-    await wrapper.find(".app-profile-panel .text-action-input").setValue("chrome");
-    await wrapper
-      .findAll(".app-profile-panel .chip")
-      .find((chip) => chip.text().trim() === "添加绑定")!
-      .trigger("click");
-    await flushPromises();
-    expect(saveAppProfiles).toHaveBeenLastCalledWith({
-      enabled: true,
-      bindings: { chrome: "generic" },
-    });
-    expect(wrapper.find(".app-profile-row").text()).toContain("chrome");
-
-    await wrapper.find(".app-profile-row .sequence-remove").trigger("click");
-    await flushPromises();
-    expect(saveAppProfiles).toHaveBeenLastCalledWith({ enabled: true, bindings: {} });
-  });
-
-  it("按键保持时长：改动即保存并提示", async () => {
-    const wrapper = await mountPage();
-    await wrapper.find("#injection-hold").setValue(50);
-    await wrapper.find("#injection-hold").trigger("change");
-    await flushPromises();
-    expect(setInjectionHoldMs).toHaveBeenCalledWith(50);
-    expect(wrapper.text()).toContain("按键保持时长已设为 50 毫秒");
   });
 
   it("按住不放：仅在已配快捷键的单击列出现，切换后写入 hold_shortcut", async () => {
