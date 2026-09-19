@@ -1092,6 +1092,8 @@ export const buttonLabels: Record<RemoteButton, string> = {
  * 机型实际存在的按键；未识别机型时按小米处理（既有行为）。
  */
 export const remoteProfileButtons: Record<string, RemoteButton[]> = {
+  // 小米遥控器实物只有这 12 个可映射键，与画布示意图一一对应；没有静音键
+  // （对齐 crates/sayall-windows/src/raw_input.rs 的 ALL_BUTTONS_XIAOMI）。
   xiaomi: [
     "back",
     "ok",
@@ -1103,7 +1105,6 @@ export const remoteProfileButtons: Record<string, RemoteButton[]> = {
     "up",
     "menu",
     "power",
-    "volume_mute",
     "volume_up",
     "volume_down",
   ],

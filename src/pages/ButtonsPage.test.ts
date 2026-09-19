@@ -156,15 +156,14 @@ beforeEach(() => {
 });
 
 describe("buttons mapping page", () => {
-  it("renders 12 canvas buttons, the voice card and 39 trigger cells including mute", async () => {
+  it("renders the 12 canvas buttons, the voice card and 36 trigger cells", async () => {
     const wrapper = await mountPage();
-    // 画布 12 键 + 语音卡 + 画布外的静音键卡（"其他按键"用的是同一种卡片）。
-    expect(wrapper.findAll(".mapping-card")).toHaveLength(14);
-    expect(wrapper.findAll(".extra-card")).toHaveLength(1);
-    // 画布 12 键 × 3 + 画布外的静音键 × 3：静音键可解码却没有示意图位置，
-    // 由"其他按键"补上（见 offCanvasButtons）。
-    expect(wrapper.findAll(".mapping-cell")).toHaveLength(39);
-    expect(wrapper.find(".extra-buttons").text()).toContain("静音");
+    // 小米遥控器实物只有这 12 个可映射键：画布 12 张卡 + 语音卡，没有画布外按键，
+    // 因此"其他按键"整块不出现（静音键只存在于 Google TV 遥控器）。
+    expect(wrapper.findAll(".mapping-card")).toHaveLength(13);
+    expect(wrapper.findAll(".extra-card")).toHaveLength(0);
+    expect(wrapper.find(".extra-buttons").exists()).toBe(false);
+    expect(wrapper.findAll(".mapping-cell")).toHaveLength(36);
     const voiceCard = wrapper.find(".voice-card");
     expect(voiceCard.text()).toContain("语音键");
     expect(voiceCard.text()).toContain("按住说话");
@@ -185,6 +184,8 @@ describe("buttons mapping page", () => {
     const extras = wrapper.find(".extra-buttons").text();
     expect(extras).toContain("YouTube");
     expect(extras).toContain("Netflix");
+    // 静音键是 Google TV 遥控器独有的（小米遥控器没有），示意图上也没有位置。
+    expect(extras).toContain("静音");
     // Google 遥控器没有菜单键：画布卡片仍是小米示意图，这里只补差集。
     expect(extras).not.toContain("菜单");
   });

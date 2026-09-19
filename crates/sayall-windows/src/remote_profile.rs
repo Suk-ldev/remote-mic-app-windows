@@ -75,7 +75,6 @@ pub const XIAOMI: RemoteProfile = RemoteProfile {
         (0x0052, RemoteButton::Up),
         (0x0065, RemoteButton::Menu),
         (0x0066, RemoteButton::Power),
-        (0x007F, RemoteButton::VolumeMute),
         (0x0080, RemoteButton::VolumeUp),
         (0x0081, RemoteButton::VolumeDown),
     ],
@@ -155,6 +154,22 @@ mod tests {
                 "usage {usage:#06x} 的解码结果与既有实现不一致"
             );
         }
+    }
+
+    #[test]
+    fn xiaomi_has_no_mute_key_and_google_tv_does() {
+        // 小米蓝牙遥控器 2 / 2 Pro 实物没有静音键（示意图 public/RC003-remote-photo@2x.png
+        // 可核对：电源、语音、方向+确定、返回、主页、菜单、音量±、TV 共 12 个）。
+        // 曾经把 HID 通用 Mute usage 0x007F 当成该机型的按键，导致界面多出一个
+        // 永远按不出来的"静音"格子。
+        assert_eq!(XIAOMI.buttons.len(), 12);
+        assert!(!XIAOMI.has_button(RemoteButton::VolumeMute));
+        assert_eq!(XIAOMI.button_for_usage(0x007F), None);
+        assert!(GOOGLE_TV.has_button(RemoteButton::VolumeMute));
+        assert_eq!(
+            GOOGLE_TV.button_for_usage(0x00E2),
+            Some(RemoteButton::VolumeMute)
+        );
     }
 
     #[test]
