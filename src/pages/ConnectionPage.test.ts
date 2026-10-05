@@ -304,6 +304,27 @@ describe("语音输入快捷键设置", () => {
     wrapper.unmount();
   });
 
+  // Chatterfly 是独立的按住型工具：按住右 Alt，不能顺带把输入法切成微信
+  // （activateWetype 同时决定微信输入法休眠重试阶梯是否武装）。
+  it("applies the Chatterfly preset as hold-to-talk right Alt without IME switching", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    const chatterfly = wrapper
+      .findAll(".voice-hotkey-presets button")
+      .find((button) => button.text().includes("Chatterfly"))!;
+    expect(chatterfly.text()).toContain("未验证");
+    await chatterfly.trigger("click");
+    await flushPromises();
+
+    expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    wrapper.unmount();
+  });
+
   // Typeless 等工具常用纯修饰键快捷键（右 Alt）：录入不能要求"终止键"，
   // 全部松开即提交。
   it("captures a modifier-only custom shortcut and saves it on release", async () => {
