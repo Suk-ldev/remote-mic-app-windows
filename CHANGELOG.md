@@ -2,7 +2,7 @@
 
 本文件记录「无线麦 SayAll」Windows 版的版本变更。遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 与 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.13] - 2026-10-05
 
 ### 新增
 - **语音工具预设加入 Chatterfly**：连接页预设新增「Chatterfly」（腾讯的 AI 语音输入工具）：按住右 Alt、按住说话、不切输入法，标「未验证」。Chatterfly 的唤起键可以自己改，以它「设置」里显示的为准；不一致就点「录入自定义按键」按一次。它和千问、豆包都用右 Alt，别同时开着。
