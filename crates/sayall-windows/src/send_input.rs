@@ -842,6 +842,15 @@ impl VoiceHotkeySettings {
         self.chord.as_ref().map_or(0, |chord| chord.keys.len())
     }
 
+    /// 微信输入法热键休眠检测与重试阶梯（ble.rs `spawn_wetype_check`）是否
+    /// 适用：只在按住说话、且用户显式把目标配置为微信输入法时成立。
+    /// 阶梯会切一次输入法配置（结束时停在微信输入法）并释放重按和弦；
+    /// 对 Chatterfly、千问、搜狗这类按住型工具，它会把用户的输入法切成
+    /// 微信、把同一段话切成几截（ConsentStore 里看不到微信开麦就会触发）。
+    pub fn wetype_revive_applies(&self) -> bool {
+        self.chord.is_some() && self.mode == VoiceHotkeyMode::Hold && self.activate_wetype
+    }
+
     pub fn validated(mut self) -> Result<Self, SendInputError> {
         match self.chord.take() {
             Some(chord) => self.chord = Some(chord.validated()?),
@@ -1648,6 +1657,37 @@ mod tests {
         assert_eq!(disabled, VoiceHotkeySettings::disabled());
         assert!(!disabled.is_enabled());
         assert_eq!(disabled.key_count(), 0);
+    }
+
+    /// 微信输入法休眠重试阶梯只属于微信输入法：Chatterfly 等其他按住型
+    /// 工具（右 Alt、不切输入法）不能被它切走输入法、释放重按和弦。
+    #[test]
+    fn wetype_revive_only_applies_to_wetype_hold_settings() {
+        let wetype = VoiceHotkeySettings {
+            chord: Some(chord(&[KeyCode::LeftControl, KeyCode::LeftWindows])),
+            mode: VoiceHotkeyMode::Hold,
+            activate_wetype: true,
+        };
+        assert!(wetype.wetype_revive_applies());
+
+        let chatterfly = VoiceHotkeySettings {
+            chord: Some(chord(&[KeyCode::RightAlt])),
+            mode: VoiceHotkeyMode::Hold,
+            activate_wetype: false,
+        };
+        assert!(!chatterfly.wetype_revive_applies());
+
+        let wetype_toggle = VoiceHotkeySettings {
+            mode: VoiceHotkeyMode::Toggle,
+            ..wetype.clone()
+        };
+        assert!(!wetype_toggle.wetype_revive_applies());
+        assert!(!VoiceHotkeySettings::disabled().wetype_revive_applies());
+
+        // v1 老文件按微信输入法读出，阶梯行为保持不变。
+        let legacy: VoiceHotkeySettings =
+            serde_json::from_str(r#"{"keys":["left_control","left_windows"]}"#).unwrap();
+        assert!(legacy.wetype_revive_applies());
     }
 
     /// 单次触发形态的开始/结束边沿都是完整点按：结束边沿必须能让目标

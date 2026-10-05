@@ -148,6 +148,16 @@ const voiceHotkeyPresets: VoiceHotkeyPreset[] = [
     settings: { chord: { keys: ["right_control"] }, mode: "hold", activateWetype: false },
   },
   {
+    // 腾讯 Chatterfly：同一个唤起键按住说话、短按开关、双击进 AI 指令，
+    // 这里只用按住说话。右 Alt 取自 GetSayAll 上游真机观察（遥控器注入右 Alt
+    // 弹出的是 Chatterfly，见 ATTRIBUTION.md），未在本仓库真机确认。
+    id: "chatterfly",
+    label: "Chatterfly",
+    hint: "按住右 Alt（以 Chatterfly「设置」里的唤起键为准，不一致就点「录入自定义按键」按一次）。它和千问、豆包都用右 Alt，别同时开着",
+    status: "untested",
+    settings: { chord: { keys: ["right_alt"] }, mode: "hold", activateWetype: false },
+  },
+  {
     id: "doubao",
     label: "豆包输入法",
     hint: "按住右 Alt。已知不可用：豆包会拦截程序注入的按键，绕开它需要挂进它的进程，本程序不做这种事",

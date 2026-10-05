@@ -563,10 +563,17 @@ fn worker_loop(
                     ));
                     continue;
                 }
-                let chord_configured = lock(&voice_hold_hotkey).chord.clone();
-                // 该阶梯只修复 Hold 形态（释放并重按按住中的和弦）；单次
-                // 触发形态重放点按会关掉刚开始的录音，武装时已跳过，这里
-                // 再做一次守卫，防配置在会话中途改动。
+                let chord_configured = {
+                    let configured = lock(&voice_hold_hotkey);
+                    configured
+                        .wetype_revive_applies()
+                        .then(|| configured.chord.clone())
+                        .flatten()
+                };
+                // 该阶梯只修复微信输入法的 Hold 形态（释放并重按按住中的
+                // 和弦）；单次触发形态重放点按会关掉刚开始的录音，其他按住型
+                // 工具会被切断，武装时已跳过，这里再做一次守卫，防配置在
+                // 会话中途改成别的工具。
                 let holding = active_hotkey
                     .as_ref()
                     .filter(|active| active.mode == VoiceHotkeyMode::Hold);
@@ -603,7 +610,7 @@ fn worker_loop(
                         }
                     }
                 } else {
-                    gatt_note("chord_retry skipped reason=no_chord".to_owned());
+                    gatt_note("chord_retry skipped reason=no_wetype_hold_chord".to_owned());
                 }
             }
             WorkerMessage::Control {
@@ -1087,10 +1094,11 @@ fn handle_control(
             let hotkey = lock(voice_hold_hotkey).clone();
             if let Some(chord) = hotkey.chord.clone() {
                 let mode = hotkey.mode;
-                // 开麦基线只服务于 Hold 形态的微信输入法休眠重试阶梯
-                // （见下）；单次触发形态不做该阶梯，因此也不读基线，
-                // 语音开始的关键路径上不多花一次 ConsentStore 查询。
-                let mic_baseline = if mode == VoiceHotkeyMode::Hold {
+                let wetype_revive = hotkey.wetype_revive_applies();
+                // 开麦基线只服务于微信输入法（Hold）的休眠重试阶梯（见下）；
+                // 不做该阶梯的配置也不读基线，语音开始的关键路径上不多花
+                // 一次 ConsentStore 查询。
+                let mic_baseline = if wetype_revive {
                     wetype_mic_observation()
                 } else {
                     None
@@ -1139,9 +1147,11 @@ fn handle_control(
                 // WeType 热键休眠检测与自动恢复（见 spawn_wetype_check）。
                 // 纪元在 StreamStarted 顶部已递增并捕获（见上），连同引用
                 // 传入，防旧阶梯跨会话误伤新会话的和弦。
-                // 仅 Hold 模式：该阶梯是"释放并重按按住中的和弦"的微信输入法
-                // 专项修复，对单次触发形态重放点按会直接关掉刚开始的录音。
-                if mode == VoiceHotkeyMode::Hold {
+                // 仅微信输入法的 Hold 配置：该阶梯是"释放并重按按住中的和弦"
+                // 的微信输入法专项修复，对单次触发形态重放点按会直接关掉
+                // 刚开始的录音；对 Chatterfly 等其他按住型工具会切走输入法、
+                // 把一段话切成几截（见 VoiceHotkeySettings::wetype_revive_applies）。
+                if wetype_revive {
                     spawn_wetype_check(
                         state,
                         sender.clone(),
@@ -1152,7 +1162,12 @@ fn handle_control(
                     );
                 } else {
                     gatt_note(format!(
-                        "chord_check skipped session={session_id} reason=toggle_mode"
+                        "chord_check skipped session={session_id} reason={}",
+                        if mode == VoiceHotkeyMode::Hold {
+                            "not_wetype"
+                        } else {
+                            "toggle_mode"
+                        }
                     ));
                 }
             } else {
