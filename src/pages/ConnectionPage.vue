@@ -56,6 +56,7 @@ const emptyConnection = (): ConnectionSnapshot => ({
   generation: 0,
   reconnectAttempt: 0,
   powerNotificationsAvailable: false,
+  voiceSynthActive: false,
   lastError: null,
 });
 
@@ -108,9 +109,10 @@ interface VoiceHotkeyPreset {
   /**
    * verified = 本项目或该工具自己的配置/日志已确认；
    * untested = 照该工具的公开默认值填，未在真机确认；
-   * blocked  = 已知不可用（该工具会丢弃程序注入的按键）。
+   * rc003    = 该工具丢弃程序注入的按键，只有 RC003 的报告层合成能唤起
+   *            （见下方豆包/Chatterfly 预设注释与 rc003_hook.rs）。
    */
-  status: "verified" | "untested" | "blocked";
+  status: "verified" | "untested" | "rc003";
   settings: VoiceHotkeySettings;
 }
 
@@ -149,19 +151,26 @@ const voiceHotkeyPresets: VoiceHotkeyPreset[] = [
   },
   {
     // 腾讯 Chatterfly：同一个唤起键按住说话、短按开关、双击进 AI 指令，
-    // 这里只用按住说话。右 Alt 取自 GetSayAll 上游真机观察（遥控器注入右 Alt
-    // 弹出的是 Chatterfly，见 ATTRIBUTION.md），未在本仓库真机确认。
+    // 这里只用按住说话。它和豆包一样丢弃程序注入的按键（上游真机实证：实体
+    // 键盘能开麦，同一组合键的各种 SendInput 表达全部无反应），因此只有 RC003
+    // 的报告层合成能唤起它——合成把语音键在 HID 报告里直接换成右 Alt，按键以
+    // 设备报告到达系统。右 Alt 取自上游真机观察（遥控器经报告层发右 Alt 时弹
+    // 出的是 Chatterfly）；它的唤起键可以自己改，以其「设置」里的为准。
     id: "chatterfly",
     label: "Chatterfly",
-    hint: "按住右 Alt（以 Chatterfly「设置」里的唤起键为准，不一致就点「录入自定义按键」按一次）。它和千问、豆包都用右 Alt，别同时开着",
-    status: "untested",
+    hint: "按住右 Alt（以 Chatterfly「设置」里的唤起键为准，不一致就点「录入自定义按键」按一次）。它丢弃程序发送的按键，只有 RC003 遥控器能唤起；它和千问、豆包都用右 Alt，别同时开着",
+    status: "rc003",
     settings: { chord: { keys: ["right_alt"] }, mode: "hold", activateWetype: false },
   },
   {
+    // 豆包输入法：ImeService 的全局低级钩子首查 LLKHF_INJECTED，命中即丢弃
+    // （Bugs/2026-09-04-doubao-voice-hold-hotkey.md 四层闭环），所以 SendInput
+    // 这条路判死。RC003 报告层合成绕开的不是它的检查，而是根本不走注入——
+    // 语音键在 HID 报告里就是右 Alt，到达系统时 injected=0。
     id: "doubao",
     label: "豆包输入法",
-    hint: "按住右 Alt。已知不可用：豆包会拦截程序注入的按键，绕开它需要挂进它的进程，本程序不做这种事",
-    status: "blocked",
+    hint: "按住右 Alt。豆包丢弃程序发送的按键，只有 RC003 遥控器能唤起（语音键在报告层直接变成右 Alt）；用豆包时请先把它设为当前输入法",
+    status: "rc003",
     settings: { chord: { keys: ["right_alt"] }, mode: "hold", activateWetype: false },
   },
   {
@@ -176,12 +185,54 @@ const voiceHotkeyPresets: VoiceHotkeyPreset[] = [
 const voiceHotkeyStatusLabels: Record<VoiceHotkeyPreset["status"], string> = {
   verified: "",
   untested: "未验证",
-  blocked: "已知不可用",
+  rc003: "需 RC003",
 };
 
 const voiceHotkeyKeysLabel = computed(() => voiceHoldHotkeyLabel(voiceHotkey.value.chord));
 
 const voiceHotkeyEnabled = computed(() => (voiceHotkey.value.chord?.keys.length ?? 0) > 0);
+
+/**
+ * 这一按会走哪条路。两条路径互斥：
+ * - 报告层合成（RC003 钩子已就位）：语音键在 HID 报告里直接变成配置的那个键，
+ *   系统当成设备按键收下，豆包/Chatterfly 这类丢弃注入按键的工具才会响应；
+ * - 程序注入（SendInput）：微信输入法、Win+H、Typeless 等接受注入的工具走这条。
+ * 显示它是为了让"按了没反应"一眼能归因，而不是只能去翻诊断日志。
+ */
+const voiceKeyDeliveryLabel = computed(() =>
+  connection.value.voiceSynthActive ? "报告层（RC003 遥控器）" : "程序注入",
+);
+
+/**
+ * 当前配置能不能走报告层。判据必须与 Rust 侧 `rc003_hook::voice_synth_usage`
+ * 一致：按住说话 + 恰好单键 + 该键在已实测白名单内（右/左 Alt）。
+ *
+ * 不按"选中了哪个预设"判断——千问、Chatterfly、豆包三个预设的设置完全相同
+ * （右 Alt + 按住说话 + 不切输入法），从设置反推不出用户选的是哪个工具。
+ */
+const voiceKeySynthEligible = computed(() => {
+  const keys = voiceHotkey.value.chord?.keys ?? [];
+  return (
+    voiceHotkey.value.mode === "hold" &&
+    keys.length === 1 &&
+    (keys[0] === "right_alt" || keys[0] === "left_alt")
+  );
+});
+
+/**
+ * 配置本可以走报告层、但合成没生效时，直说缺什么。
+ *
+ * 只在"本可以走报告层"时出现：微信输入法等和弦配置看到这段话只会是噪音，
+ * 它们本来就该走程序注入。
+ */
+const voiceKeyDeliveryWarning = computed(() => {
+  if (!voiceHotkeyEnabled.value) return "";
+  if (connection.value.voiceSynthActive || !voiceKeySynthEligible.value) return "";
+  if (connection.value.remoteModel !== "rc003") {
+    return "现在这个键按程序注入发送。豆包、Chatterfly 会丢弃程序发送的按键，只有 RC003（小米蓝牙语音遥控器 2 Pro）能唤起它们；接受程序按键的工具（千问、搜狗等）不受影响。";
+  }
+  return "现在这个键按程序注入发送。要让豆包、Chatterfly 响应，需要 RC003 的报告层合成生效：请确认遥控器已连接，且应用以管理员身份运行。";
+});
 
 function sameKeys(left: VoiceHotkeySettings, right: VoiceHotkeySettings): boolean {
   const a = [...(left.chord?.keys ?? [])].sort().join("+");
@@ -751,7 +802,14 @@ onUnmounted(() => {
             <strong>触发方式</strong>
             <span>{{ voiceHotkeyEnabled ? voiceHotkeyModeLabel(voiceHotkey.mode) : "未启用" }}</span>
           </div>
+          <div v-if="voiceHotkeyEnabled" class="setting-row">
+            <strong>按键送达方式</strong>
+            <span>{{ voiceKeyDeliveryLabel }}</span>
+          </div>
         </div>
+        <p v-if="voiceKeyDeliveryWarning" class="muted voice-hotkey-row">
+          {{ voiceKeyDeliveryWarning }}
+        </p>
         <p class="muted voice-hotkey-row">按住遥控器语音键说话，松开即停止；语音会送入右侧选中的设备，由微信输入法、Typeless 等工具转成文字。语音工具自己的快捷键在这里配置：先选预设或录入自定义按键，再按该工具的要求选触发方式。</p>
         <div class="button-row voice-hotkey-presets">
           <button

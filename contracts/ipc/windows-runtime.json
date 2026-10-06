@@ -26,6 +26,7 @@
       "generation": 7,
       "reconnectAttempt": 2,
       "powerNotificationsAvailable": true,
+      "voiceSynthActive": true,
       "lastError": null
     },
     "audio": {

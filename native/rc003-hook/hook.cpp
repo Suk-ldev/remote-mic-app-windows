@@ -29,6 +29,79 @@ static void PushEdge(LONG button, LONG pressed) {
     shared->edge_head = pos + 1;
 }
 
+// Rewrite every voice-key slot to the armed usage, in place. Returns the number
+// of slots rewritten (0 = this report does not carry the voice key).
+//
+// Position matters and could not be settled by reading code alone: it is not
+// established whether the consumer ingests this buffer DURING the real call or
+// reads it after the call returns. So the substitution runs at BOTH points and
+// never restores. The transform is idempotent per slot (0x003E -> target, and a
+// slot already holding the target is left alone), so running it twice is the same
+// as running it once, and whichever side consumes the buffer sees a patched
+// report. Patching only one position risks delivering the key one report late --
+// on a state-semantics report that would mean Alt going down on RELEASE and
+// staying down, i.e. a stuck modifier. See ATTRIBUTION.md (2026-10-06).
+static unsigned PatchVoiceSlots(unsigned char* d, ULONG len, unsigned to) {
+    if (!HookReportHeaderOk(d, len)) return 0;
+    unsigned written = 0;
+    for (unsigned i = 3; i < 9; i += 2) {
+        const unsigned u = d[i] | (static_cast<unsigned>(d[i + 1]) << 8);
+        if (u != kVoiceKeyUsage) continue;
+        const unsigned char low = static_cast<unsigned char>(to & 0xffu);
+        const unsigned char high = static_cast<unsigned char>((to >> 8) & 0xffu);
+        bool wrote = false;
+        __try {
+            d[i] = low;
+            d[i + 1] = high;
+            wrote = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            wrote = false;
+        }
+        if (!wrote) {
+            // Not writable as mapped. Lift protection for the two bytes, write,
+            // then put the original protection back -- the same fallback the
+            // upstream agent needed in this host (ATTRIBUTION.md).
+            DWORD previous = 0;
+            if (VirtualProtect(d + i, 2, PAGE_READWRITE, &previous)) {
+                __try {
+                    d[i] = low;
+                    d[i + 1] = high;
+                    wrote = true;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    wrote = false;
+                }
+                DWORD restored = 0;
+                VirtualProtect(d + i, 2, previous, &restored);
+            }
+        }
+        if (!wrote) {
+            if (shared) InterlockedIncrement(&shared->synth_write_failed);
+            continue;
+        }
+        // Read back: a successful store is not proof the replacement is what the
+        // next reader will see (the upstream agent verifies for the same reason).
+        const unsigned back = d[i] | (static_cast<unsigned>(d[i + 1]) << 8);
+        if (back != to) {
+            if (shared) InterlockedIncrement(&shared->synth_verify_failed);
+            continue;
+        }
+        ++written;
+        if (shared) InterlockedIncrement(&shared->synth_written);
+    }
+    return written;
+}
+
+// Is the voice key present in this report? Counted separately before and after
+// the real call so one real-machine run tells us which position actually carries
+// the live report, without another probe build.
+static bool VoiceKeyPresent(const unsigned char* d, ULONG len) {
+    if (!HookReportHeaderOk(d, len)) return false;
+    for (unsigned i = 3; i < 9; i += 2) {
+        if ((d[i] | (static_cast<unsigned>(d[i + 1]) << 8)) == kVoiceKeyUsage) return true;
+    }
+    return false;
+}
+
 static void ProcessReport(const unsigned char* buf, ULONG len) {
     unsigned mask = 0;
     if (!HookDecodeTargets(buf, len, mask)) return;
@@ -44,21 +117,42 @@ static void ProcessReport(const unsigned char* buf, ULONG len) {
     ReleaseSRWLockExclusive(&g_lock);
 }
 
-// Read-only observation: the real call runs first and its result/last-error are
-// returned unchanged. We only read the completed output buffer for the carrier.
+// Observation never touches the real I/O: the real call runs first and its
+// result/last-error are returned unchanged. The only write is the voice-key
+// substitution, and only while the app has armed it (synth_to != 0).
 static NTSTATUS NTAPI HookIoctl(HANDLE file, HANDLE event, PIO_APC_ROUTINE apc,
     PVOID context, PIO_STATUS_BLOCK iosb, ULONG code, PVOID input, ULONG input_size,
     PVOID output, ULONG output_size) {
     // Mark this module busy for the whole call so teardown can wait us out before
     // unloading. Balanced by the decrement below on every return path.
     InterlockedIncrement(&g_active);
+    const bool carrier = code == kReadCharacteristicIoctl && output && output_size == 9 &&
+        shared && InterlockedCompareExchange(&shared->state, 0, 0) == HS_Capturing;
+    // Snapshot the armed target once: the app may disarm mid-call, and the two
+    // substitution points must agree on what this report is being rewritten to.
+    const unsigned synth = carrier
+        ? static_cast<unsigned>(InterlockedCompareExchange(&shared->synth_to, 0, 0))
+        : 0u;
+    unsigned char* const buffer = reinterpret_cast<unsigned char*>(output);
+    if (synth && HookSynthUsageAllowed(synth)) {
+        __try {
+            if (VoiceKeyPresent(buffer, output_size)) {
+                InterlockedIncrement(&shared->synth_seen_before);
+                PatchVoiceSlots(buffer, output_size, synth);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
     const NTSTATUS result = real_ioctl(file, event, apc, context, iosb, code,
         input, input_size, output, output_size);
     const DWORD saved = GetLastError();
-    if (result == 0 && code == kReadCharacteristicIoctl && output && output_size == 9 &&
-        shared && InterlockedCompareExchange(&shared->state, 0, 0) == HS_Capturing) {
-        __try { ProcessReport(reinterpret_cast<const unsigned char*>(output), output_size); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (result == 0 && carrier) {
+        __try {
+            ProcessReport(buffer, output_size);
+            if (synth && HookSynthUsageAllowed(synth) && VoiceKeyPresent(buffer, output_size)) {
+                InterlockedIncrement(&shared->synth_seen_after);
+                PatchVoiceSlots(buffer, output_size, synth);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     SetLastError(saved);
     InterlockedDecrement(&g_active);

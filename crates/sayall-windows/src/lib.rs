@@ -167,6 +167,10 @@ pub struct ConnectionSnapshot {
     pub generation: u64,
     pub reconnect_attempt: u32,
     pub power_notifications_available: bool,
+    /// 语音键报告层合成是否正在生效（RC003 钩子已回执当前快捷键）。为真时
+    /// 「按住说话快捷键」由 HID 报告直接送达系统，SendInput 注入路径停用；
+    /// 界面据此如实显示这一按会走哪条路，不让"按了没反应"无从归因。
+    pub voice_synth_active: bool,
     pub last_error: Option<String>,
 }
 
@@ -215,6 +219,7 @@ impl Default for ConnectionSnapshot {
             generation: 0,
             reconnect_attempt: 0,
             power_notifications_available: false,
+            voice_synth_active: false,
             last_error: None,
         }
     }
@@ -410,7 +415,17 @@ impl WindowsPlatform {
         lock(&self.voice_hold_hotkey).clone()
     }
 
+    /// 更新「按住说话快捷键」，并联动语音键报告层合成（配置单一事实源 = 这个
+    /// 设置，钩子侧不另存一份）。
+    ///
+    /// 按住说话 + 单键 + 已实测 usage（右/左 Alt）时，RC003 钩子在报告层把语音键
+    /// 换成该键，按键以设备报告到达系统，豆包/Chatterfly 这类丢弃注入按键的工具
+    /// 才会响应；其余配置不下发合成，继续走既有 SendInput 注入路径。两条路径由
+    /// `rc003_hook::voice_synth_active` 二选一，不允许叠加。
     pub fn set_voice_hold_hotkey(&self, hotkey: send_input::VoiceHotkeySettings) {
+        #[cfg(windows)]
+        self.rc003_hook
+            .set_voice_synth(rc003_hook::voice_synth_usage(&hotkey));
         *lock(&self.voice_hold_hotkey) = hotkey;
     }
 
@@ -579,7 +594,11 @@ impl WindowsPlatform {
     pub fn connection_snapshot(&self) -> ConnectionSnapshot {
         #[cfg(windows)]
         {
-            self.runtime.snapshot()
+            let mut snapshot = self.runtime.snapshot();
+            // 合成门禁是全局运行态（钩子回执驱动），不属于 BLE 状态机，
+            // 因此在读出快照时现取——界面要显示"这一按会走哪条路"。
+            snapshot.voice_synth_active = rc003_hook::voice_synth_active();
+            snapshot
         }
 
         #[cfg(not(windows))]

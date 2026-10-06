@@ -38,6 +38,7 @@ fn rust_serialization_matches_the_shared_windows_runtime_contract() {
                 generation: 7,
                 reconnect_attempt: 2,
                 power_notifications_available: true,
+                voice_synth_active: true,
                 last_error: None,
             },
             audio: AudioSnapshot {

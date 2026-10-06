@@ -128,6 +128,7 @@ describe("Rust and TypeScript IPC contract", () => {
       "generation",
       "reconnectAttempt",
       "powerNotificationsAvailable",
+      "voiceSynthActive",
       "lastError",
     ]);
     expectExactKeys(platformSnapshot.connection.capabilities!, [

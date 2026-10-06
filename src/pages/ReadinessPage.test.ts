@@ -33,6 +33,7 @@ function setup(overrides: Partial<Record<string, unknown>> = {}) {
     generation: 0,
     reconnectAttempt: 0,
     powerNotificationsAvailable: false,
+    voiceSynthActive: false,
     lastError: null,
     ...(overrides.connection as object),
   });
