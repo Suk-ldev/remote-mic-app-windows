@@ -21,6 +21,7 @@ const emptyConnection: ConnectionSnapshot = {
   generation: 0,
   reconnectAttempt: 0,
   powerNotificationsAvailable: false,
+  voiceSynthActive: false,
   lastError: null,
 };
 
@@ -273,6 +274,75 @@ describe("语音输入快捷键设置", () => {
     wrapper.unmount();
   });
 
+  // "按了没反应"必须一眼能归因：按键走的是报告层还是程序注入要如实显示，
+  // 选了只认报告层的工具却没生效时还要直说缺什么。
+  it("按键送达方式：合成生效时显示报告层，且不再提示缺条件", async () => {
+    mocks.getVoiceHoldHotkey.mockResolvedValue({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    mocks.getConnectionSnapshot.mockResolvedValue({
+      ...emptyConnection,
+      remoteModel: "rc003",
+      voiceSynthActive: true,
+    });
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("报告层（RC003 遥控器）");
+    expect(wrapper.text()).not.toContain("按程序注入发送");
+    wrapper.unmount();
+  });
+
+  it("按键送达方式：RC003 已连但合成未生效时说明缺什么", async () => {
+    mocks.getVoiceHoldHotkey.mockResolvedValue({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    mocks.getConnectionSnapshot.mockResolvedValue({
+      ...emptyConnection,
+      remoteModel: "rc003",
+      voiceSynthActive: false,
+    });
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("程序注入");
+    expect(wrapper.text()).toContain("请确认遥控器已连接，且应用以管理员身份运行");
+    wrapper.unmount();
+  });
+
+  it("按键送达方式：遥控器不是 RC003 时直说这两个工具唤不起来", async () => {
+    mocks.getVoiceHoldHotkey.mockResolvedValue({
+      chord: { keys: ["right_alt"] },
+      mode: "hold",
+      activateWetype: false,
+    });
+    mocks.getConnectionSnapshot.mockResolvedValue({
+      ...emptyConnection,
+      remoteModel: "rc001",
+      voiceSynthActive: false,
+    });
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("只有 RC003");
+    wrapper.unmount();
+  });
+
+  // 微信输入法走的是注入路径：不能因为新增了报告层就给它贴错标签，
+  // 也不该对它弹"需要 RC003"的提示。
+  it("按键送达方式：和弦配置显示程序注入，且不给无关的 RC003 提示", async () => {
+    const wrapper = mount(ConnectionPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("程序注入");
+    expect(wrapper.text()).not.toContain("按程序注入发送");
+    wrapper.unmount();
+  });
+
   it("switches to single-trigger mode without losing the configured chord", async () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } });
     await flushPromises();
@@ -304,17 +374,21 @@ describe("语音输入快捷键设置", () => {
     wrapper.unmount();
   });
 
-  // Chatterfly 是独立的按住型工具：按住右 Alt，不能顺带把输入法切成微信
+  // Chatterfly 与豆包都丢弃程序注入的按键，只有 RC003 报告层合成能唤起：
+  // 预设必须是单个右 Alt（和弦无法在一个报告槽里表达）+ 按住说话 + 不切输入法
   // （activateWetype 同时决定微信输入法休眠重试阶梯是否武装）。
-  it("applies the Chatterfly preset as hold-to-talk right Alt without IME switching", async () => {
+  it.each([
+    ["Chatterfly", "Chatterfly"],
+    ["豆包输入法", "豆包"],
+  ])("applies the %s preset as report-layer right Alt without IME switching", async (label) => {
     const wrapper = mount(ConnectionPage, { props: { runtime } });
     await flushPromises();
 
-    const chatterfly = wrapper
+    const preset = wrapper
       .findAll(".voice-hotkey-presets button")
-      .find((button) => button.text().includes("Chatterfly"))!;
-    expect(chatterfly.text()).toContain("未验证");
-    await chatterfly.trigger("click");
+      .find((button) => button.text().includes(label))!;
+    expect(preset.text()).toContain("需 RC003");
+    await preset.trigger("click");
     await flushPromises();
 
     expect(mocks.setVoiceHoldHotkey).toHaveBeenCalledWith({
@@ -401,13 +475,13 @@ describe("语音输入快捷键设置", () => {
     wrapper.unmount();
   });
 
-  it("语音工具预设带状态标注：未验证与已知不可用都写在按钮上", async () => {
+  it("语音工具预设带状态标注：未验证与需 RC003 都写在按钮上", async () => {
     const wrapper = mount(ConnectionPage, { props: { runtime } });
     await flushPromises();
 
     const presets = wrapper.findAll(".voice-hotkey-presets button");
     const doubao = presets.find((button) => button.text().includes("豆包输入法"))!;
-    expect(doubao.text()).toContain("已知不可用");
+    expect(doubao.text()).toContain("需 RC003");
     const sogou = presets.find((button) => button.text().includes("搜狗语音输入"))!;
     expect(sogou.text()).toContain("未验证");
     // 已验证的预设不加标注。

@@ -222,6 +222,8 @@ export interface ConnectionSnapshot {
   generation: number;
   reconnectAttempt: number;
   powerNotificationsAvailable: boolean;
+  /** 语音键是否正由 RC003 报告层合成送达（为真时不再走 SendInput 注入）。 */
+  voiceSynthActive: boolean;
   lastError: string | null;
 }
 
@@ -354,6 +356,7 @@ const browserSnapshot: RuntimeSnapshot = {
       generation: 0,
       reconnectAttempt: 0,
       powerNotificationsAvailable: false,
+      voiceSynthActive: false,
       lastError: null,
     },
     audio: {

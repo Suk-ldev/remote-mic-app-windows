@@ -41,7 +41,38 @@
 - `wasapi-rs` 0.24.0：MIT 许可的 Windows Core Audio 安全封装，用于端点枚举、共享模式渲染与 padding 查询。
 - **CABLE Input 端点静音自愈（2026-09-07）**：依据 Microsoft Core Audio `IAudioEndpointVolume` / Endpoint Volume Controls 公共 API（`learn.microsoft.com/windows/win32/api/endpointvolume/nn-endpointvolume-iaudioendpointvolume`、`learn.microsoft.com/windows/win32/coreaudio/endpoint-volume-controls`），共享模式端点的主静音属于端点级状态，不是应用 WASAPI 写入成功即可证明可听。本仓库仅对名称确认的 VB-CABLE 渲染端点在打开时及每次语音会话开始前调用 `GetMute` → 必要时 `SetMute(FALSE)` → `GetMute` 读回确认；不修改物理输出设备，也不覆盖用户音量标量。调用结果、检查点和耗时写入结构化 GATT 诊断日志。
 - **SayAll 会话静音自愈（2026-09-07）**：用户现场观察到音量合成器左侧 CABLE Input 端点未静音，但右侧“无线麦 SayAll”应用会话在开始推流后很快重新静音。依据 Microsoft `IAudioClient::Initialize` 文档，渲染会话默认会跨应用重启持久化音量与静音状态；依据 `ISimpleAudioVolume::GetMute/SetMute`，应用会话静音独立于端点主静音。实现使用 `IAudioSessionManager2::GetSessionEnumerator` + `IAudioSessionControl2::GetProcessId`，只锁定当前 SayAll 进程在用户已选 CABLE 端点上的会话；初始化、语音会话开始、`IAudioClient::Start` 后读回，并在推流期间每 100ms 低频检查，发现静音才解除，不修改会话音量、不碰系统声音或其他进程。初始化时另以 `IAudioSessionControl2::SetDuckingPreference(TRUE)` 让 SayAll 会话退出 Windows 默认通信自动压低机制；该预防措施不作为外部静音来源已经归因的证据。官方依据：`learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize`、`learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-isimpleaudiovolume-setmute`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessionmanager2-getsessionenumerator`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessioncontrol2-getprocessid`、`learn.microsoft.com/windows/win32/api/audiopolicy/nf-audiopolicy-iaudiosessioncontrol2-setduckingpreference`。
-- **Chatterfly 语音工具预设（2026-10-05）**：腾讯 Chatterfly（`chatterfly.tencent.com`）的公开资料（chinaz `ainews/31118`、ai-bot.cn、sheep5 试用文）只写了 Mac 默认 Fn 唤起：同一个键短按开关、按住说话、双击进 AI 指令，唤起键可在设置里改。Windows 默认键没有公开说明；`GetSayAll/remote-mic-app-windows` 提交 `c7f125e`（2026-10-02，上游真机）观察到遥控器注入右 Alt 时弹出的是 Chatterfly 语音输入（`ChatterflyCloud` 常驻），上游把它与 Vokie 一起归为“抢右 Alt”的工具。本仓库据此把预设填为“按住右 Alt、按住说话、不切输入法”，标“未验证”，并提示以 Chatterfly 设置里的唤起键为准。只使用其全局快捷键，不读取 Chatterfly 的私有配置（第三方 App 边界）；未复制上游代码。同一专项发现微信输入法休眠重试阶梯（`ble.rs` `spawn_wetype_check`）原本对所有 Hold 配置武装，会对其他按住型工具切输入法、释放重按和弦，已收窄为 `VoiceHotkeySettings::wetype_revive_applies`（Hold + `activateWetype`）。真机验证 deferred。
+- **语音键报告层合成（2026-10-06，豆包/Chatterfly 支持）**：机制来源是
+  `GetSayAll/remote-mic-app-windows` v0.5.0 的「全按键支持」——其提权助手向承载
+  RC003 HID-over-GATT 的 WUDFHost 注入 Frida agent（`hardware/RC003/helper/agent/rc003_agent.js`，
+  提交 `e5374a9` 时点），在 `NtDeviceIoControlFile`（IOCTL `0x80018483`，9 字节报文、
+  三个 16 位 usage 槽）上把语音键 usage `0x003E` **槽内替换**为目标 usage，使按键以
+  设备报告而非 `SendInput` 进入系统。白名单与实测口径一并借鉴：`SYNTH_FROM_WHITELIST=[0x003E]`、
+  `SYNTH_TO_WHITELIST=[0x00E6,0x00E2]`（其探针 `wudf_ioctl_synth.py` 实测 0x00E6 → VK_RMENU、
+  0x00E2 → VK_LMENU），以及「替换 usage 必须逐键实测」「合成生效期间注入路径必须停用，
+  否则双写互扰（其 2026-09-29 run8 真机）」「HID 报告是状态语义，usage 从报告消失即 UP，
+  粘键结构上不可能」三条结论。**未复制其代码**：本仓库复用既有的 Detours C++ 钩子
+  （`native/rc003-hook/`，2026-09-13 已真机验证的同一 IOCTL 与报文布局）实现同一变换，
+  不引入 Frida、不新增提权助手（主程序清单本就是 `requireAdministrator`）。
+  差异与边界：上游在按下帧加过「门内延迟」等输入法切换，2026-10-03 真机回归后默认关闭
+  （上游 `4600128`），本仓库不实现，也不在合成路径切输入法；上游在 `onEnter` 单点替换并在
+  `onLeave` 还原，本仓库在真实调用前后各做一次幂等替换且不还原——因为"消费方在调用期间
+  摄取还是调用返回后读取"无法从代码静态判定，单点替换一旦押错会把按下沿延后一个报告
+  （状态语义下等于 Alt 在**松开时**按下并保持，即粘键）。两处分别计数，一次真机运行即可定论。
+- **Chatterfly 对模拟按键的实测边界（2026-09-23，上游 `GetSayAll` 分支
+  `codex/chatterfly-hotkey-diagnosis`，记录 `Bugs/2026-09-23-chatterfly-ime-activation-observability.md`
+  与 `docs/investigations/2026-09-23-chatterfly-trigger-route-selection.md`）**：同一文本框、
+  焦点保持、会话级 TSF 已读回 Chatterfly 的前提下，实体键盘可开麦，而 `SendInput` 的扫描码/
+  虚拟键 × 顺序 × 0/80ms 间隔各种表达均无反应（左 Ctrl+左 Win 与左 Ctrl+左 Alt 两组快捷键
+  结论一致，排除"仅 Win 参与组合键"假设）；`ITfKeystrokeMgr` preserved key 四种查询
+  `not_registered`、语言栏枚举无其按钮、其快捷键设置不接受 F5——公开用户态触发入口全部判死。
+  微软依据同上游所引：`SendInput` 只保证事件进入输入流、不保证第三方消费；`KBDLLHOOKSTRUCT`
+  说明低级钩子可区分注入事件。本仓库据此把 Chatterfly 与豆包同列为「只有报告层能唤起」，
+  不做隐藏注入标志、私有协议或进程注入的绕过（第三方 App 边界）。
+- **Chatterfly 语音工具预设（2026-10-05，已被 2026-10-06 修正）**：腾讯 Chatterfly（`chatterfly.tencent.com`）的公开资料（chinaz `ainews/31118`、ai-bot.cn、sheep5 试用文）只写了 Mac 默认 Fn 唤起：同一个键短按开关、按住说话、双击进 AI 指令，唤起键可在设置里改。Windows 默认键没有公开说明；`GetSayAll/remote-mic-app-windows` 提交 `c7f125e`（2026-10-02，上游真机）观察到遥控器注入右 Alt 时弹出的是 Chatterfly 语音输入（`ChatterflyCloud` 常驻），上游把它与 Vokie 一起归为“抢右 Alt”的工具。本仓库据此把预设填为“按住右 Alt、按住说话、不切输入法”，标“未验证”，并提示以 Chatterfly 设置里的唤起键为准。
+  **2026-10-06 修正**：该推断的关键一环是错的——上游那次观察到的“注入右 Alt 弹出 Chatterfly”，
+  其按键实际来自上述**报告层合成**而非 `SendInput`；Chatterfly 与豆包一样丢弃注入的按键
+  （见上条实测边界），因此本仓库 0.2.13 的 Chatterfly 预设在真机上必然无反应。预设改标
+  「需 RC003」并接上报告层合成，`status` 取值 `blocked` 随之由 `rc003` 取代。只使用其全局快捷键，不读取 Chatterfly 的私有配置（第三方 App 边界）；未复制上游代码。同一专项发现微信输入法休眠重试阶梯（`ble.rs` `spawn_wetype_check`）原本对所有 Hold 配置武装，会对其他按住型工具切输入法、释放重按和弦，已收窄为 `VoiceHotkeySettings::wetype_revive_applies`（Hold + `activateWetype`）。真机验证 deferred。
 
 ## 延迟调研来源（2026-09-05，语音键按下→电平图出现优化专项）
 

@@ -11,6 +11,13 @@
 // Must run elevated (Administrator). The SayAll app spawns this, keeps it as a
 // child, and closes its stdin to request an unhook. Only button id + up/down is
 // emitted; no raw HID payload or device identity ever leaves this process.
+//
+// stdin also carries one command, newline-terminated, from the app:
+//   "synth <hex-usage>"  arm voice-key substitution (whitelisted usages only)
+//   "synth off"          disarm
+// Each is answered on stdout with "synth_ack to=<hex>" / "synth_ack off" (or
+// "synth_nak <reason>"). The app treats the ack as the gate for suppressing its
+// own SendInput path, so an unacknowledged command must never read as armed.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
@@ -142,6 +149,72 @@ static std::wstring Basename(const std::wstring& path) {
     return pos == std::wstring::npos ? path : path.substr(pos + 1);
 }
 
+// Apply one newline-stripped command from the app. Unknown or out-of-whitelist
+// input is rejected loudly rather than ignored: the app gates its own injection
+// path on the ack, so a silently dropped command would leave the voice key with
+// no path at all.
+static void ApplyCommand(HookShared* shared, const std::string& line) {
+    if (line.rfind("synth ", 0) != 0) {
+        std::printf("synth_nak reason=unknown_command\n");
+        return;
+    }
+    const std::string argument = line.substr(6);
+    if (argument == "off") {
+        InterlockedExchange(&shared->synth_to, 0);
+        std::printf("synth_ack off\n");
+        return;
+    }
+    unsigned usage = 0;
+    if (argument.empty() || argument.size() > 4) {
+        std::printf("synth_nak reason=usage_not_whitelisted\n");
+        return;
+    }
+    for (const char c : argument) {
+        unsigned digit = 0;
+        if (c >= '0' && c <= '9') digit = static_cast<unsigned>(c - '0');
+        else if (c >= 'a' && c <= 'f') digit = static_cast<unsigned>(c - 'a') + 10u;
+        else if (c >= 'A' && c <= 'F') digit = static_cast<unsigned>(c - 'A') + 10u;
+        else { usage = 0; break; }
+        usage = (usage << 4) | digit;
+    }
+    if (!HookSynthUsageAllowed(usage)) {
+        std::printf("synth_nak reason=usage_not_whitelisted\n");
+        return;
+    }
+    InterlockedExchange(&shared->synth_to, static_cast<LONG>(usage));
+    std::printf("synth_ack to=%04X\n", usage);
+}
+
+// Drain whatever the app has written without ever blocking: PeekNamedPipe first
+// reports how much is buffered, so the ReadFile below cannot stall the edge loop.
+// Returns false when the pipe is gone (parent closed stdin = teardown request).
+static bool PumpCommands(HANDLE stdin_handle, HookShared* shared, std::string& pending) {
+    for (;;) {
+        char probe = 0;
+        DWORD available = 0;
+        if (PeekNamedPipe(stdin_handle, &probe, 1, nullptr, &available, nullptr) == FALSE) {
+            const DWORD e = GetLastError();
+            return !(e == ERROR_BROKEN_PIPE || e == ERROR_INVALID_HANDLE);
+        }
+        if (!available) return true;
+        char buffer[512];
+        DWORD read = 0;
+        const DWORD want = available < sizeof(buffer) ? available : static_cast<DWORD>(sizeof(buffer));
+        if (ReadFile(stdin_handle, buffer, want, &read, nullptr) == FALSE || !read) return false;
+        pending.append(buffer, read);
+        for (;;) {
+            const size_t end = pending.find('\n');
+            if (end == std::string::npos) break;
+            std::string line = pending.substr(0, end);
+            pending.erase(0, end + 1);
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+            if (!line.empty()) ApplyCommand(shared, line);
+        }
+        // A peer that never sends a newline must not grow this buffer unbounded.
+        if (pending.size() > 4096) pending.clear();
+    }
+}
+
 // Stage the hook DLL into a fresh, ACL-locked ProgramData directory. SYSTEM and
 // Administrators get full control; LOCAL SERVICE (the WUDFHost) gets read+execute
 // only so it can map the DLL but never tamper with it; ordinary users get nothing.
@@ -230,6 +303,10 @@ int wmain() {
         shared->magic = kHookMagic;
         shared->stop = 0;
         shared->state = HS_Idle;
+        // A mapping that survived a previous run (ERROR_ALREADY_EXISTS, so not
+        // zeroed above) must not start out armed: substitution stays off until the
+        // app asks for it in this run.
+        shared->synth_to = 0;
 
         // Stage a fresh, uniquely-named hook DLL and inject it. The DLL unloads
         // itself on teardown (no pin), so it does not accumulate in the long-lived
@@ -284,6 +361,9 @@ int wmain() {
         HANDLE stdin_h = GetStdHandle(STD_INPUT_HANDLE);
         Handle host(OpenProcess(SYNCHRONIZE, FALSE, pid));
         LONG tail = shared->edge_head;  // ignore any edges from before we attached
+        std::string pending;
+        LONG reported_written = -1, reported_before = -1, reported_after = -1;
+        ULONGLONG next_synth_report = 0;
         for (;;) {
             // Drain new edges.
             const LONG head = shared->edge_head;
@@ -295,12 +375,29 @@ int wmain() {
                 ++tail;
             }
             // Teardown conditions: parent closed stdin, or host gone.
-            char probe = 0; DWORD got = 0;
-            if (PeekNamedPipe(stdin_h, &probe, 1, &got, nullptr, nullptr) == FALSE) {
-                const DWORD e = GetLastError();
-                if (e == ERROR_BROKEN_PIPE || e == ERROR_INVALID_HANDLE) break;  // parent gone
-            }
+            if (!PumpCommands(stdin_h, shared, pending)) break;  // parent gone
             if (host.value && WaitForSingleObject(host.value, 0) == WAIT_OBJECT_0) break;  // WUDFHost exited
+            // Substitution counters, at most once per second and only when they
+            // move. before/after tell which side of the real call carries the live
+            // report -- the one question the code could not answer statically.
+            const LONG written = shared->synth_written;
+            const LONG before = shared->synth_seen_before;
+            const LONG after = shared->synth_seen_after;
+            const ULONGLONG now = GetTickCount64();
+            if ((written != reported_written || before != reported_before || after != reported_after) &&
+                now >= next_synth_report) {
+                std::fprintf(stderr,
+                    "stage=synth result=observed to=%04lX seen_before=%ld seen_after=%ld written=%ld "
+                    "verify_failed=%ld write_failed=%ld\n",
+                    static_cast<unsigned long>(shared->synth_to), before, after, written,
+                    static_cast<long>(shared->synth_verify_failed),
+                    static_cast<long>(shared->synth_write_failed));
+                std::fflush(stderr);
+                reported_written = written;
+                reported_before = before;
+                reported_after = after;
+                next_synth_report = now + 1000;
+            }
             Sleep(8);
         }
         InterlockedExchange(&shared->stop, 1);

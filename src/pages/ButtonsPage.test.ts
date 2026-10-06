@@ -90,6 +90,7 @@ const runtime: RuntimeSnapshot = {
       generation: 0,
       reconnectAttempt: 0,
       powerNotificationsAvailable: false,
+      voiceSynthActive: false,
       lastError: null,
     },
     audio: {

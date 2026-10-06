@@ -1092,7 +1092,16 @@ fn handle_control(
             // macOS 版"语音键模拟 Fn 点按"的单次触发形态）：先注入开始边沿，
             // 再开始音频会话；注入失败直接中止本次会话并统一释放。
             let hotkey = lock(voice_hold_hotkey).clone();
-            if let Some(chord) = hotkey.chord.clone() {
+            if hotkey.chord.is_some() && crate::rc003_hook::voice_synth_active() {
+                // 报告层合成已生效（RC003 钩子已回执）：系统在报告层就收到了这个
+                // 键（injected=0），这里**不能**再注入同一个和弦——双写互扰，且
+                // 注入的那一份会被豆包/Chatterfly 丢弃。不设置 active_hotkey：
+                // 合成的释放沿由报告本身给出（usage 从报告里消失 = 该键 UP），
+                // 结构上成对，不需要也不应该补发结束边沿。
+                gatt_note(format!(
+                    "chord_press result=skipped session={session_id} reason=report_layer_synth note=OS 已在报告层收到该键，注入路径停用"
+                ));
+            } else if let Some(chord) = hotkey.chord.clone() {
                 let mode = hotkey.mode;
                 let wetype_revive = hotkey.wetype_revive_applies();
                 // 开麦基线只服务于微信输入法（Hold）的休眠重试阶梯（见下）；
