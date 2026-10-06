@@ -25,12 +25,28 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const PROGRESS_EMIT_MIN_INTERVAL_BYTES: u64 = 128 * 1024;
 const ENDPOINT_OVERRIDE_ENV: &str = "SAYALL_UPDATER_ENDPOINT";
-const PREVIEW_RELEASES_FEED: &str =
-    "https://github.com/GetSayAll/remote-mic-app-windows/releases.atom";
+/// 本仓库的 GitHub 仓库名。**预览通道与稳定端点必须是同一个仓库**：稳定端点在
+/// `tauri.conf.json`，预览通道由下面三个常量拼出来，两边分开写就会漂移——
+/// 2026-10-06 的真实故障正是如此（稳定端点早已改到本仓库，预览通道还留在上游，
+/// 于是 0.2.13 的用户被提示"发现新版本 0.5.0"，那是上游的版本号；下载后又会
+/// 因为签名是上游密钥而验签失败）。`same_repo_as_configured_stable_endpoint`
+/// 用 tauri.conf.json 的实际内容钉住这条一致性。
+const RELEASES_REPO: &str = "Suk-ldev/remote-mic-app-windows";
 const PREVIEW_MANIFEST_NAME: &str = "latest.json";
-const RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/GetSayAll/remote-mic-app-windows/releases/download/";
 /// 前端进度事件名（downloaded/contentLength/finished）。
 const PROGRESS_EVENT: &str = "app-update-progress";
+
+fn preview_releases_feed() -> String {
+    format!("https://github.com/{RELEASES_REPO}/releases.atom")
+}
+
+fn release_tag_url_prefix() -> String {
+    format!("https://github.com/{RELEASES_REPO}/releases/tag/")
+}
+
+fn release_download_path_prefix() -> String {
+    format!("/{RELEASES_REPO}/releases/download/")
+}
 
 /// 端点无有效更新清单（如仓库尚无已发布 Release 导致 latest.json 404）时的
 /// 呈现规则（2026-09-06 用户终裁）：与"服务器确认无新版本"一致，均提示
@@ -146,6 +162,7 @@ fn preview_manifest_endpoint(
     // 开关语义是“包含预览版”，不是“只看预览版”：在所有已发布的正式版
     // 与预览版中按 SemVer 取最高版本，避免较旧预览版遮住较新的正式版。
     // GitHub Releases Atom feed 不包含 Draft；tag 从公开的 alternate 链接读取。
+    let tag_prefix = release_tag_url_prefix();
     let Some((tag, _)) = feed
         .entries
         .iter()
@@ -156,9 +173,7 @@ fn preview_manifest_endpoint(
                 .find(|link| link.rel == "alternate")?
                 .href
                 .trim_end_matches('/');
-            let tag = href.strip_prefix(
-                "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/",
-            )?;
+            let tag = href.strip_prefix(tag_prefix.as_str())?;
             semver::Version::parse(tag.trim_start_matches('v'))
                 .ok()
                 .map(|version| (tag.to_owned(), version))
@@ -168,13 +183,15 @@ fn preview_manifest_endpoint(
         return Ok(None);
     };
     let url = format!(
-        "https://github.com/GetSayAll/remote-mic-app-windows/releases/download/{tag}/{PREVIEW_MANIFEST_NAME}"
+        "https://github.com/{RELEASES_REPO}/releases/download/{tag}/{PREVIEW_MANIFEST_NAME}"
     )
     .parse::<reqwest::Url>()
     .map_err(|_| PreviewManifestError::InvalidReleaseUrl)?;
     let trusted = url.scheme() == "https"
         && url.host_str() == Some("github.com")
-        && url.path().starts_with(RELEASE_DOWNLOAD_PATH_PREFIX);
+        && url
+            .path()
+            .starts_with(release_download_path_prefix().as_str());
     if !trusted {
         return Err(PreviewManifestError::InvalidReleaseUrl);
     }
@@ -219,7 +236,7 @@ async fn resolve_update_endpoint(include_prereleases: bool) -> Result<UpdateEndp
             "预览版更新暂时不可用，请稍后重试".to_owned()
         })?;
     let response = client
-        .get(PREVIEW_RELEASES_FEED)
+        .get(preview_releases_feed())
         .header("Accept", "application/atom+xml")
         .send()
         .await
@@ -546,9 +563,7 @@ mod tests {
                 .map(|tag| ReleaseFeedEntry {
                     links: vec![ReleaseFeedLink {
                         rel: "alternate".to_owned(),
-                        href: format!(
-                            "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/{tag}"
-                        ),
+                        href: format!("{}{tag}", release_tag_url_prefix()),
                     }],
                 })
                 .collect(),
@@ -562,26 +577,63 @@ mod tests {
         assert_eq!(tag, "v0.2.2");
         assert_eq!(
             endpoint.as_str(),
-            "https://github.com/GetSayAll/remote-mic-app-windows/releases/download/v0.2.2/latest.json"
+            "https://github.com/Suk-ldev/remote-mic-app-windows/releases/download/v0.2.2/latest.json"
         );
     }
 
+    /// 预览通道必须和稳定端点指同一个仓库。分开写就会漂移：2026-10-06 本仓库
+    /// 0.2.13 的用户被提示"发现新版本 0.5.0"——那是上游 GetSayAll 的版本号，
+    /// 因为稳定端点早已改到本仓库而预览通道还留在上游（下载后又必然验签失败，
+    /// 两边的 minisign 公钥不同）。断言直接读 tauri.conf.json 的实际内容。
+    #[test]
+    fn preview_channel_uses_the_same_repo_as_the_configured_stable_endpoint() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json");
+        let endpoints = config["plugins"]["updater"]["endpoints"]
+            .as_array()
+            .expect("updater endpoints");
+        assert!(!endpoints.is_empty(), "稳定端点不得为空");
+        for endpoint in endpoints {
+            let endpoint = endpoint.as_str().expect("endpoint 必须是字符串");
+            assert!(
+                endpoint.starts_with(&format!("https://github.com/{RELEASES_REPO}/")),
+                "稳定端点 {endpoint} 与预览通道仓库 {RELEASES_REPO} 不一致"
+            );
+        }
+        assert!(
+            preview_releases_feed().starts_with(&format!("https://github.com/{RELEASES_REPO}/"))
+        );
+        assert!(
+            release_tag_url_prefix().starts_with(&format!("https://github.com/{RELEASES_REPO}/"))
+        );
+    }
+
+    /// 别的仓库的 Release 链接一律不认：上游（或任何第三方）的 feed 条目混进来
+    /// 也不能被当成本仓库的更新。
     #[test]
     fn preview_channel_ignores_foreign_and_non_semver_links() {
         let releases = ReleasesFeed {
-            entries: vec![ReleaseFeedEntry {
-                links: vec![
-                    ReleaseFeedLink {
+            entries: vec![
+                ReleaseFeedEntry {
+                    links: vec![
+                        ReleaseFeedLink {
+                            rel: "alternate".to_owned(),
+                            href: "https://example.com/releases/tag/v9.9.9".to_owned(),
+                        },
+                        ReleaseFeedLink {
+                            rel: "self".to_owned(),
+                            href: format!("{}not-a-version", release_tag_url_prefix()),
+                        },
+                    ],
+                },
+                ReleaseFeedEntry {
+                    links: vec![ReleaseFeedLink {
                         rel: "alternate".to_owned(),
-                        href: "https://example.com/releases/tag/v9.9.9".to_owned(),
-                    },
-                    ReleaseFeedLink {
-                        rel: "self".to_owned(),
-                        href: "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/not-a-version"
+                        href: "https://github.com/GetSayAll/remote-mic-app-windows/releases/tag/v9.9.9"
                             .to_owned(),
-                    },
-                ],
-            }],
+                    }],
+                },
+            ],
         };
         assert!(preview_manifest_endpoint(&releases).unwrap().is_none());
     }
@@ -601,7 +653,9 @@ mod tests {
         };
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("github.com"));
-        assert!(url.path().starts_with(RELEASE_DOWNLOAD_PATH_PREFIX));
+        assert!(url
+            .path()
+            .starts_with(release_download_path_prefix().as_str()));
         assert!(url.path().ends_with("/latest.json"));
     }
 
